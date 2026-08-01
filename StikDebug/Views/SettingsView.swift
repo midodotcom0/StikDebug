@@ -29,6 +29,7 @@ struct SettingsView: View {
     @State private var ddiStatusMessage: String = ""
     @State private var ddiResultMessage: (text: String, isError: Bool)?
     @StateObject private var lockdownProbe = LockdownReachabilityProbe()
+    @StateObject private var remotePairingDiscovery = RemotePairingDiscoveryProbe()
 
     private var appVersion: String {
         let marketingVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -144,20 +145,22 @@ struct SettingsView: View {
                             .keyboardType(.numbersAndPunctuation)
                             .frame(maxWidth: 160)
                     }
-                    Button {
-                        lockdownProbe.start(host: targetDeviceIP)
-                    } label: {
-                        HStack {
-                            Label("Test Lockdown Port 62078", systemImage: "network")
-                            Spacer()
-                            if lockdownProbe.status.isRunning {
-                                ProgressView()
-                                    .controlSize(.small)
+                    ForEach([UInt16(49152), 58783, 62078], id: \.self) { port in
+                        Button {
+                            lockdownProbe.start(host: targetDeviceIP, port: port)
+                        } label: {
+                            HStack {
+                                Label(portProbeLabel(port), systemImage: "network")
+                                Spacer()
+                                if lockdownProbe.status.isRunning && lockdownProbe.testedPort == port {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
                             }
                         }
+                        .foregroundStyle(.primary)
+                        .disabled(lockdownProbe.status.isRunning || remotePairingDiscovery.status.isRunning)
                     }
-                    .foregroundStyle(.primary)
-                    .disabled(lockdownProbe.status.isRunning)
 
                     if lockdownProbe.status != .idle {
                         Label(lockdownProbeMessage, systemImage: lockdownProbeSymbol)
@@ -168,6 +171,27 @@ struct SettingsView: View {
                     Text("Reachability only. This test does not read or transmit pairing data.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Button {
+                        remotePairingDiscovery.start()
+                    } label: {
+                        HStack {
+                            Label("Discover Remote Pairing", systemImage: "dot.radiowaves.left.and.right")
+                            Spacer()
+                            if remotePairingDiscovery.status.isRunning {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                        }
+                    }
+                    .foregroundStyle(.primary)
+                    .disabled(remotePairingDiscovery.status.isRunning || lockdownProbe.status.isRunning)
+
+                    if remotePairingDiscovery.status != .idle {
+                        Label(remotePairingMessage, systemImage: remotePairingSymbol)
+                            .font(.caption)
+                            .foregroundStyle(remotePairingColor)
+                    }
 
                     Button { openAppFolder() } label: {
                         Label("App Folder", systemImage: "folder")
@@ -258,21 +282,74 @@ struct SettingsView: View {
     }
 
     private var lockdownProbeMessage: String {
+        let port = lockdownProbe.testedPort
         switch lockdownProbe.status {
         case .idle:
             return ""
         case .running(let host):
-            return "Connecting to \(host):62078…"
+            return "Connecting to \(host):\(port)…"
         case .reachable(let host):
-            return "Success: \(host):62078 accepts TCP connections."
+            return "Success: \(host):\(port) accepts TCP connections."
         case .refused(let host):
-            return "Refused: \(host) responded, but nothing accepts TCP connections on port 62078."
+            return "Refused: \(host) responded, but nothing accepts TCP connections on port \(port)."
         case .timedOut(let host):
-            return "Timeout: no TCP response from \(host):62078 within 5 seconds."
+            return "Timeout: no TCP response from \(host):\(port) within 5 seconds."
         case .invalidAddress:
             return "Enter a numeric IPv4 or IPv6 target address first."
         case .failed(let host, let reason):
-            return "Failed to reach \(host):62078: \(reason)"
+            return "Failed to reach \(host):\(port): \(reason)"
+        }
+    }
+
+    private func portProbeLabel(_ port: UInt16) -> String {
+        switch port {
+        case 49152:
+            return "Test Remote Pairing Port 49152"
+        case 58783:
+            return "Test RemoteXPC Port 58783"
+        case 62078:
+            return "Test Lockdown Port 62078"
+        default:
+            return "Test TCP Port \(port)"
+        }
+    }
+
+    private var remotePairingMessage: String {
+        switch remotePairingDiscovery.status {
+        case .idle:
+            return ""
+        case .browsing:
+            return "Searching for Apple's Remote Pairing service, including peer-to-peer…"
+        case .connecting(let service):
+            return "Found \(service); testing the advertised endpoint…"
+        case .reachable(let endpoint):
+            return "Success: Remote Pairing is reachable at \(endpoint)."
+        case .notFound:
+            return "No Remote Pairing service was advertised within 7 seconds."
+        case .failed(let reason):
+            return "Remote Pairing discovery failed: \(reason)"
+        }
+    }
+
+    private var remotePairingSymbol: String {
+        switch remotePairingDiscovery.status {
+        case .idle, .browsing, .connecting:
+            return "dot.radiowaves.left.and.right"
+        case .reachable:
+            return "checkmark.circle.fill"
+        case .notFound, .failed:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var remotePairingColor: Color {
+        switch remotePairingDiscovery.status {
+        case .idle, .browsing, .connecting:
+            return .secondary
+        case .reachable:
+            return .green
+        case .notFound, .failed:
+            return .orange
         }
     }
 

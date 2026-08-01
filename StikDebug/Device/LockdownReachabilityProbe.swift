@@ -2,7 +2,7 @@
 //  LockdownReachabilityProbe.swift
 //  StikDebug
 //
-//  Read-only TCP reachability check for lockdownd's conventional port.
+//  Read-only TCP reachability check for Apple device-service ports.
 //
 
 import Combine
@@ -26,15 +26,14 @@ enum LockdownReachabilityStatus: Equatable {
 
 @MainActor
 final class LockdownReachabilityProbe: ObservableObject {
-    static let port: NWEndpoint.Port = 62078
-
     @Published private(set) var status: LockdownReachabilityStatus = .idle
+    @Published private(set) var testedPort: UInt16 = 62078
 
     private let connectionQueue = DispatchQueue(label: "com.stik.stikdebug.lockdown-reachability")
     private var connection: NWConnection?
     private var timeoutTask: Task<Void, Never>?
 
-    func start(host rawHost: String, timeout: TimeInterval = 5) {
+    func start(host rawHost: String, port rawPort: UInt16 = 62078, timeout: TimeInterval = 5) {
         cancelCurrentConnection()
 
         let host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -43,12 +42,18 @@ final class LockdownReachabilityProbe: ObservableObject {
             return
         }
 
+        guard let port = NWEndpoint.Port(rawValue: rawPort) else {
+            status = .failed(host: host, reason: "Invalid TCP port")
+            return
+        }
+
         let connection = NWConnection(
             host: NWEndpoint.Host(host),
-            port: Self.port,
+            port: port,
             using: .tcp
         )
 
+        testedPort = rawPort
         self.connection = connection
         status = .running(host: host)
 
