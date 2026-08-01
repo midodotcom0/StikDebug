@@ -10,7 +10,8 @@ import SwiftUI
 @main
 struct StikDebugApp: App {
     @Environment(\.scenePhase) private var scenePhase
-    @State private var shouldAttemptTunnelReconnect = false
+    @StateObject private var coordinator = ConnectionCoordinator.shared
+    @AppStorage(UserDefaults.Keys.autoConnectOnLaunch) private var autoConnectOnLaunch = true
 
     init() {
         AppBootstrapper.configure()
@@ -19,8 +20,10 @@ struct StikDebugApp: App {
     var body: some Scene {
         WindowGroup {
             MainTabView()
+                .environmentObject(coordinator)
                 .task {
                     await downloadMissingDeveloperDiskImageFiles()
+                    await connectOnLaunchIfEnabled()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     handleScenePhaseChange(newPhase)
@@ -29,31 +32,34 @@ struct StikDebugApp: App {
     }
 
     private func handleScenePhaseChange(_ newPhase: ScenePhase) {
-        switch newPhase {
-        case .background:
-            shouldAttemptTunnelReconnect = true
-        case .active:
-            if shouldAttemptTunnelReconnect {
-                shouldAttemptTunnelReconnect = false
-                startTunnelInBackground(showErrorUI: false)
-            }
-        default:
-            break
-        }
+        // The RSD session is sticky and survives backgrounding, so returning to the
+        // foreground no longer tears it down and rebuilds it. Reconnecting here was
+        // one of the two paths that raced to present an alert at launch.
+        guard newPhase == .active else { return }
+        MountingProgress.shared.checkforMounted()
     }
 
+    @MainActor
+    private func connectOnLaunchIfEnabled() async {
+        guard autoConnectOnLaunch else { return }
+        // Background attempt: failures land in the status banner and the log, never
+        // in a dialog. Tools and Location Simulation stay reachable regardless.
+        try? await coordinator.ensureReady(.tunnelOnly, userInitiated: false)
+    }
+
+    @MainActor
     private func downloadMissingDeveloperDiskImageFiles() async {
         do {
             try await DeveloperDiskImageService.shared.downloadMissingFiles()
-            MountingProgress.shared.pubMount()
         } catch {
-            await MainActor.run {
-                showAlert(
-                    title: "An Error has Occurred",
-                    message: "[Download DDI Error]: \(error.localizedDescription)",
-                    showOk: true
-                )
-            }
+            // Downloading is not mounting. Mounting happens only after a tunnel is up,
+            // and only when something actually needs the image.
+            coordinator.report(
+                stage: .mount,
+                title: "Developer Image Download Failed",
+                message: error.localizedDescription,
+                userInitiated: false
+            )
         }
     }
 }

@@ -14,6 +14,7 @@ enum AppFeature: String, CaseIterable, Identifiable {
     case profiles
     case processes
     case location
+    case diagnostics
     case settings
 
     var id: String {
@@ -38,6 +39,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
             return "Processes"
         case .location:
             return "Location"
+        case .diagnostics:
+            return "Diagnostics"
         case .settings:
             return "Settings"
         }
@@ -61,6 +64,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
             return "Inspect running apps"
         case .location:
             return "Simulate GPS location"
+        case .diagnostics:
+            return "Check which device services are reachable"
         case .settings:
             return "Configure StikDebug"
         }
@@ -70,6 +75,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
         switch self {
         case .location:
             return "Location Simulation"
+        case .diagnostics:
+            return "Connection Diagnostics"
         default:
             return title
         }
@@ -93,6 +100,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
             return "rectangle.stack.person.crop"
         case .location:
             return "location"
+        case .diagnostics:
+            return "stethoscope"
         case .settings:
             return "gearshape.fill"
         }
@@ -117,6 +126,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
             ProcessInspectorView()
         case .location:
             LocationSimulationView()
+        case .diagnostics:
+            ConnectionDiagnosticsView()
         case .settings:
             SettingsView()
         }
@@ -125,5 +136,5 @@ enum AppFeature: String, CaseIterable, Identifiable {
 
 extension AppFeature {
     static let mainTabs: [AppFeature] = [.home, .tools, .settings]
-    static let toolList: [AppFeature] = [.scripts, .console, .deviceInfo, .profiles, .processes, .location]
+    static let toolList: [AppFeature] = [.scripts, .console, .deviceInfo, .profiles, .processes, .location, .diagnostics]
 }

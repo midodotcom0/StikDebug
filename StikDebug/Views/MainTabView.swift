@@ -51,6 +51,9 @@ private enum ExternalLocationAction: Identifiable {
 
 struct MainTabView: View {
     @AppStorage("primaryTabSelection") private var selection: String = AppFeature.home.id
+    @EnvironmentObject private var coordinator: ConnectionCoordinator
+    /// Observed so the banner's mount percentage actually ticks.
+    @ObservedObject private var mounting = MountingProgress.shared
     @State private var detachedFeature: AppFeature?
     @State private var didSetInitialHome = false
     @State private var pendingLocationAction: ExternalLocationAction?
@@ -65,6 +68,21 @@ struct MainTabView: View {
                         .tabItem { Label(feature.title, systemImage: feature.systemImage) }
                         .tag(feature.id)
                 }
+            }
+            // Connection problems are reported here and only here, as one alert.
+            // Everything the user can reach without a device connection — Tools,
+            // Location Simulation, Settings — stays navigable behind it.
+            .alert(item: $coordinator.failure) { failure in
+                Alert(
+                    title: Text(failure.title),
+                    message: Text(failure.message),
+                    primaryButton: .default(Text("Try Again")) {
+                        coordinator.retry()
+                    },
+                    secondaryButton: .cancel(Text("Dismiss")) {
+                        coordinator.cancel()
+                    }
+                )
             }
             .onAppear {
                 ensureSelectionIsValid()
@@ -112,6 +130,50 @@ struct MainTabView: View {
                 }
             }
         }
+        .overlay(alignment: .top) {
+            connectionBanner
+                .transition(.move(edge: .top).combined(with: .opacity))
+        }
+        .animation(.default, value: coordinator.phase)
+    }
+
+    /// Non-blocking status. Replaces the launch-time alerts: a failed connection is
+    /// information here, not an interruption.
+    @ViewBuilder
+    private var connectionBanner: some View {
+        switch coordinator.phase {
+        case .idle, .ready:
+            EmptyView()
+        case .connecting, .mounting:
+            bannerContent(text: coordinator.statusText, isError: false, showsCancel: true)
+        case .connected:
+            EmptyView()
+        case .failed:
+            bannerContent(text: coordinator.statusText, isError: true, showsCancel: false)
+        }
+    }
+
+    private func bannerContent(text: String, isError: Bool, showsCancel: Bool) -> some View {
+        HStack(spacing: 10) {
+            if !isError {
+                ProgressView().controlSize(.small)
+            }
+
+            Text(text)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(isError ? .red : .primary)
+
+            if showsCancel {
+                Button("Cancel") { coordinator.cancel() }
+                    .font(.footnote.weight(.semibold))
+                    .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(.ultraThinMaterial))
+        .shadow(radius: 3)
+        .padding(.top, 8)
     }
 
     private func ensureSelectionIsValid() {
@@ -155,19 +217,21 @@ struct MainTabView: View {
 
     private func confirmSimulatedLocation(from url: URL) {
         guard let coordinate = coordinate(from: url) else {
-            showAlert(
+            coordinator.report(
+                stage: .tunnel,
                 title: "Invalid Location URL",
                 message: "Use stikdebug://simulate-location?lat=37.3349&lon=-122.0090",
-                showOk: true
+                userInitiated: true
             )
             return
         }
 
         guard coordinateIsValid(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
-            showAlert(
+            coordinator.report(
+                stage: .tunnel,
                 title: "Invalid Coordinates",
                 message: "Latitude must be between -90 and 90. Longitude must be between -180 and 180.",
-                showOk: true
+                userInitiated: true
             )
             return
         }
@@ -186,53 +250,67 @@ struct MainTabView: View {
 
     private func simulateLocation(from url: URL) {
         guard let coordinate = coordinate(from: url) else {
-            showAlert(
+            coordinator.report(
+                stage: .tunnel,
                 title: "Invalid Location URL",
                 message: "Use stikdebug://simulate-location?lat=37.3349&lon=-122.0090",
-                showOk: true
+                userInitiated: true
             )
             return
         }
 
         guard coordinateIsValid(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
-            showAlert(
+            coordinator.report(
+                stage: .tunnel,
                 title: "Invalid Coordinates",
                 message: "Latitude must be between -90 and 90. Longitude must be between -180 and 180.",
-                showOk: true
+                userInitiated: true
             )
             return
         }
 
         let pairingFile = PairingFileStore.prepareURL()
         guard FileManager.default.fileExists(atPath: pairingFile.path) else {
-            showAlert(
+            coordinator.report(
+                stage: .pairing,
                 title: "Pairing File Required",
                 message: "Import a pairing file before simulating location from a URL.",
-                showOk: true
+                userInitiated: true
             )
             return
         }
 
-        LocationSimulationCommandQueue.shared.async {
-            let code = simulate_location(
-                DeviceConnectionContext.targetIPAddress,
-                coordinate.latitude,
-                coordinate.longitude,
-                pairingFile.path
-            )
+        Task {
+            // Connect on demand. The coordinator reports any problem as the single
+            // alert above, so no second dialog can appear from here.
+            do {
+                try await coordinator.ensureReady(.tunnelAndDDI, userInitiated: true)
+            } catch {
+                return
+            }
 
-            DispatchQueue.main.async {
-                if code == 0 {
-                    BackgroundLocationManager.shared.requestStart()
-                    LogManager.shared.addInfoLog(
-                        String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)
-                    )
-                } else {
-                    showAlert(
-                        title: "Location Simulation Failed",
-                        message: "Could not simulate location from URL (error \(code)). Make sure the device is connected and the DDI is mounted.",
-                        showOk: true
-                    )
+            LocationSimulationCommandQueue.shared.async {
+                let code = simulate_location(
+                    DeviceConnectionContext.targetIPAddress,
+                    coordinate.latitude,
+                    coordinate.longitude,
+                    pairingFile.path
+                )
+
+                Task { @MainActor in
+                    if code == 0 {
+                        BackgroundLocationManager.shared.requestStart()
+                        LogManager.shared.addInfoLog(
+                            String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)
+                        )
+                    } else {
+                        coordinator.report(
+                            stage: .mount,
+                            title: "Location Simulation Failed",
+                            message: "Could not simulate location from URL (error \(code)). Make sure the device is connected and the Developer Disk Image is mounted.",
+                            userInitiated: true
+                        )
+                    }
                 }
             }
         }
@@ -241,15 +319,16 @@ struct MainTabView: View {
     private func clearSimulatedLocation() {
         LocationSimulationCommandQueue.shared.async {
             let code = clear_simulated_location()
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 if code == 0 {
                     BackgroundLocationManager.shared.requestStop()
                     LogManager.shared.addInfoLog("Cleared simulated location from URL")
                 } else {
-                    showAlert(
+                    coordinator.report(
+                        stage: .mount,
                         title: "Clear Location Failed",
                         message: "Could not clear simulated location from URL (error \(code)).",
-                        showOk: true
+                        userInitiated: true
                     )
                 }
             }
@@ -302,5 +381,6 @@ struct MainTabView: View {
 struct MainTabView_Previews: PreviewProvider {
     static var previews: some View {
         MainTabView()
+            .environmentObject(ConnectionCoordinator.shared)
     }
 }

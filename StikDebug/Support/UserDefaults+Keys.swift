@@ -15,5 +15,12 @@ extension UserDefaults {
         static let defaultScriptName = "DefaultScriptName"
         static let defaultScriptNameValue = ""
         static let targetDeviceIP = "TunnelDeviceIP"
+        /// Pins a single `DeviceTransportKind` instead of trying both. Absent means auto.
+        static let transportOverride = "DeviceTransportOverride"
+        /// Remembers which transport last worked so it is tried first next time.
+        static let lastSuccessfulTransport = "LastSuccessfulDeviceTransport"
+        /// Connects the tunnel on launch. Off means the connection is built the first
+        /// time a feature actually needs it.
+        static let autoConnectOnLaunch = "autoConnectOnLaunch"
     }
 }

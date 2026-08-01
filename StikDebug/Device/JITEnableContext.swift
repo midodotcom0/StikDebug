@@ -17,35 +17,17 @@ typealias SyslogErrorHandler = (NSError?) -> Void
 final class JITEnableContext {
     static let shared = JITEnableContext()
 
-    private struct TunnelHandles {
-        var adapter: OpaquePointer?
-        var handshake: OpaquePointer?
-
-        mutating func free() {
-            if let handshake {
-                rsd_handshake_free(handshake)
-                self.handshake = nil
-            }
-            if let adapter {
-                adapter_free(adapter)
-                self.adapter = nil
-            }
-        }
-    }
-
-    private var adapter: OpaquePointer?
-    private var handshake: OpaquePointer?
-
-    private let tunnelLock = NSLock()
-    private var tunnelConnecting = false
-    private var tunnelSemaphore: DispatchSemaphore?
-    private var lastTunnelError: NSError?
-
     private let syslogQueue = DispatchQueue(label: "com.stik.syslogrelay.queue")
     private var syslogStreaming = false
     private var syslogClient: OpaquePointer?
     private var syslogLineHandler: SyslogLineHandler?
     private var syslogErrorHandler: SyslogErrorHandler?
+
+    // The RSD session lives in `DeviceTransport`, which knows how to reach it over
+    // either RemotePairing (Wi-Fi only) or CoreDeviceProxy (also without Wi-Fi) and
+    // keeps it alive across network handoffs.
+    private var adapter: OpaquePointer? { DeviceTransport.shared.adapterHandle }
+    private var handshake: OpaquePointer? { DeviceTransport.shared.handshakeHandle }
 
     var adapterHandle: OpaquePointer? { adapter }
     var handshakeHandle: OpaquePointer? { handshake }
@@ -63,12 +45,7 @@ final class JITEnableContext {
 
     deinit {
         stopSyslogRelay()
-        if let handshake {
-            rsd_handshake_free(handshake)
-        }
-        if let adapter {
-            adapter_free(adapter)
-        }
+        // The RSD session is owned by `DeviceTransport`, not by this context.
     }
 
     private func makeError(_ message: String, code: Int = -1) -> NSError {
@@ -113,140 +90,23 @@ final class JITEnableContext {
         logger?(message)
     }
 
-    private func getPairingFile() throws -> OpaquePointer {
-        let pairingFileURL = PairingFileStore.prepareURL()
-
-        guard FileManager.default.fileExists(atPath: pairingFileURL.path) else {
-            throw makeError("Pairing file not found!", code: -17)
-        }
-
-        var pairingFile: OpaquePointer?
-        let ffiError = pairingFileURL.path.withCString { path in
-            rp_pairing_file_read(path, &pairingFile)
-        }
-
-        if let ffiError {
-            throw error(from: ffiError, fallback: "Failed to read pairing file!")
-        }
-
-        guard let pairingFile else {
-            throw makeError("Failed to read pairing file!", code: -17)
-        }
-
-        return pairingFile
-    }
-
-    private func createTunnel(hostname: String) throws -> TunnelHandles {
-        let pairingFile = try getPairingFile()
-        defer { rp_pairing_file_free(pairingFile) }
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(49152).bigEndian
-
-        let deviceIP = DeviceConnectionContext.targetIPAddress
-        let parseResult = deviceIP.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
-        guard parseResult == 1 else {
-            throw makeError("Failed to parse target IP address.", code: -18)
-        }
-
-        var tunnel = TunnelHandles()
-        let ffiError = hostname.withCString { hostname in
-            withUnsafePointer(to: &addr) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    tunnel_create_rppairing(
-                        $0,
-                        socklen_t(MemoryLayout<sockaddr_in>.stride),
-                        hostname,
-                        pairingFile,
-                        nil,
-                        nil,
-                        &tunnel.adapter,
-                        &tunnel.handshake
-                    )
-                }
-            }
-        }
-
-        if let ffiError {
-            throw error(from: ffiError, fallback: "Failed to create tunnel")
-        }
-
-        guard tunnel.adapter != nil, tunnel.handshake != nil else {
-            var incompleteTunnel = tunnel
-            incompleteTunnel.free()
-            throw makeError("Tunnel was created without valid handles")
-        }
-
-        return tunnel
-    }
-
+    /// Establishes the shared RSD session, picking whichever transport can reach the
+    /// device on the current network. Blocking — call off the main thread.
     func startTunnel() throws {
-        tunnelLock.lock()
-        if tunnelConnecting {
-            let waitSemaphore = tunnelSemaphore
-            tunnelLock.unlock()
-
-            if let waitSemaphore {
-                waitSemaphore.wait()
-                waitSemaphore.signal()
-            }
-
-            if let lastTunnelError {
-                throw lastTunnelError
-            }
-            return
-        }
-
-        tunnelConnecting = true
-        let completionSemaphore = DispatchSemaphore(value: 0)
-        tunnelSemaphore = completionSemaphore
-        tunnelLock.unlock()
-
-        var newAdapter: OpaquePointer?
-        var newHandshake: OpaquePointer?
-        var finalError: NSError?
-
-        defer {
-            tunnelLock.lock()
-            tunnelConnecting = false
-            tunnelSemaphore = nil
-            lastTunnelError = finalError
-            tunnelLock.unlock()
-            completionSemaphore.signal()
-        }
-
-        do {
-            let newTunnel = try createTunnel(hostname: "StikDebug")
-            newAdapter = newTunnel.adapter
-            newHandshake = newTunnel.handshake
-        } catch let tunnelError as NSError {
-            finalError = tunnelError
-            throw tunnelError
-        }
-
-        if let handshake {
-            rsd_handshake_free(handshake)
-        }
-        if let adapter {
-            adapter_free(adapter)
-        }
-
-        adapter = newAdapter
-        handshake = newHandshake
+        try DeviceTransport.shared.connectIfNeeded()
     }
 
     func ensureTunnel() throws {
-        if adapter == nil || handshake == nil {
-            try startTunnel()
-        }
+        try DeviceTransport.shared.connectIfNeeded()
     }
 
+    /// Debug sessions intentionally run on their own tunnel rather than the shared
+    /// one, so a crashed inferior cannot take the app's session down with it.
     private func withFreshDebugTunnel<T>(
         hostname: String,
         _ body: (OpaquePointer, OpaquePointer) throws -> T
     ) throws -> T {
-        var tunnel = try createTunnel(hostname: hostname)
+        var tunnel = try DeviceTransport.shared.createDetachedTunnel(hostname: hostname)
         defer { tunnel.free() }
 
         guard let adapter = tunnel.adapter, let handshake = tunnel.handshake else {
@@ -475,7 +335,7 @@ final class JITEnableContext {
                     )
                 }
 
-                var tunnel = try self.createTunnel(hostname: "StikDebugHeartbeat")
+                var tunnel = try DeviceTransport.shared.createDetachedTunnel(hostname: "StikDebugHeartbeat")
                 guard let adapter = tunnel.adapter, let handshake = tunnel.handshake else {
                     tunnel.free()
                     throw self.makeError("Tunnel is not connected")

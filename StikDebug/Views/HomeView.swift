@@ -13,8 +13,10 @@ struct HomeView: View {
     @AppStorage(UserDefaults.Keys.confirmExternalJITRequests) private var confirmExternalJITRequests = true
 
     @ObservedObject private var mounting = MountingProgress.shared
+    @EnvironmentObject private var coordinator: ConnectionCoordinator
 
     @State private var hasAppeared = false
+    @State private var localAlert: ConnectionCoordinator.Failure?
     @State private var pendingJITEnableConfiguration: JITEnableConfiguration?
     @State private var isShowingPairingFilePicker = false
     @State private var debugFeedback: DebugFeedback?
@@ -79,6 +81,13 @@ struct HomeView: View {
             allowedContentTypes: PairingFileStore.supportedContentTypes,
             onCompletion: importPairingFile
         )
+        .alert(item: $localAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
         .sheet(item: $scriptRunModel) { model in
             NavigationStack {
                 RunJSView(model: model)
@@ -93,7 +102,10 @@ struct HomeView: View {
     }
 
     private func handleAppear() {
-        startTunnelInBackground()
+        // Listing installed apps needs the tunnel, so ask for it — but as a background
+        // request. A failure here shows in the status banner and must not block
+        // navigation to Tools or Location Simulation.
+        coordinator.ensureReadyInBackground(.tunnelOnly)
         MountingProgress.shared.checkforMounted()
         hasAppeared = true
 
@@ -118,7 +130,7 @@ struct HomeView: View {
     }
 
     private func refreshMountStatusIfNeeded() {
-        guard mounting.mountingThread == nil, !mounting.coolisMounted else {
+        guard !mounting.isMounting, !mounting.coolisMounted else {
             return
         }
         MountingProgress.shared.checkforMounted()
@@ -129,8 +141,10 @@ struct HomeView: View {
         case .success(let url):
             do {
                 try PairingFileStore.importFromPicker(url)
-                markTunnelDisconnected()
-                startTunnelInBackground()
+                // A new pairing record invalidates the current session, so drop it and
+                // rebuild with the new credentials.
+                coordinator.invalidate()
+                coordinator.ensureReadyInBackground(.tunnelOnly)
                 NotificationCenter.default.post(name: .pairingFileImported, object: nil)
                 AlertPresenter.dismissPresentedAlert()
             } catch {
@@ -223,8 +237,7 @@ struct HomeView: View {
                 pendingJITEnableConfiguration = config
             }
         case .killProcess(let pid):
-            markTunnelDisconnected()
-            startTunnelInBackground(showErrorUI: false)
+            coordinator.ensureReadyInBackground(.tunnelOnly)
             DispatchQueue.global(qos: .userInitiated).async {
                 sleep(1)
                 do {
@@ -284,7 +297,11 @@ struct HomeView: View {
             } catch {
                 semaphore.signal()
                 DispatchQueue.main.async {
-                    showAlert(title: "Error Occurred While Executing Script.".localized, message: error.localizedDescription, showOk: true)
+                    localAlert = ConnectionCoordinator.Failure(
+                        stage: .tunnel,
+                        title: "Error Occurred While Executing Script.".localized,
+                        message: error.localizedDescription
+                    )
                 }
             }
         }
@@ -299,25 +316,19 @@ struct HomeView: View {
         }
         AccessibilityAnnouncer.announce(startingMessage)
 
-        if triggeredByURLScheme {
-            markTunnelDisconnected()
-            startTunnelInBackground(showErrorUI: false)
-        }
-
         DispatchQueue.global(qos: .background).async {
             let keepAliveLease = DebugKeepAliveLease()
             defer { keepAliveLease.invalidate() }
 
-            if triggeredByURLScheme, !waitForJITPrerequisites() {
+            // One place decides whether the device is reachable and the image is
+            // mounted, and it raises at most one alert doing so. Previously this
+            // polled two flags for 20 seconds and then added an alert of its own on
+            // top of whatever the tunnel and mount had already shown.
+            guard prepareForJIT() else {
                 DispatchQueue.main.async {
                     withAnimation {
                         debugFeedback = nil
                     }
-                    showAlert(
-                        title: "Failed to Enable JIT".localized,
-                        message: "The device connection or Developer Disk Image wasn't ready in time. Open StikDebug directly, wait for it to finish connecting, then try again.".localized,
-                        showOk: true
-                    )
                 }
                 return
             }
@@ -343,7 +354,11 @@ struct HomeView: View {
 
                     if !success {
                         let failureMessage = detail ?? "StikDebug could not launch or attach to the selected app. Check that the VPN is enabled, the pairing file is current, and the app is still installed.".localized
-                        showAlert(title: "Failed to Enable JIT".localized, message: failureMessage, showOk: true)
+                        localAlert = ConnectionCoordinator.Failure(
+                            stage: .tunnel,
+                            title: "Failed to Enable JIT".localized,
+                            message: failureMessage
+                        )
                     }
                 }
             }
@@ -394,15 +409,29 @@ struct HomeView: View {
         }
     }
 
-    private func waitForJITPrerequisites(timeout: TimeInterval = 20) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if TunnelManager.shared.isConnected && MountingProgress.shared.coolisMounted {
-                return true
+    /// Brings the connection and the Developer Disk Image up, then reports whether
+    /// JIT can proceed. Call from a background queue — it blocks that queue while the
+    /// coordinator works on the main actor, which is safe because the main thread
+    /// itself is never blocked.
+    private func prepareForJIT(timeout: TimeInterval = 60) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = ResultBox()
+
+        let coordinator = ConnectionCoordinator.shared
+        Task {
+            do {
+                try await coordinator.ensureReady(.tunnelAndDDI, userInitiated: true)
+                result.value = true
+            } catch {
+                result.value = false
             }
-            usleep(250_000)
+            semaphore.signal()
         }
-        return TunnelManager.shared.isConnected && MountingProgress.shared.coolisMounted
+
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
+            return false
+        }
+        return result.value
     }
 
     private func base64URLToBase64(_ base64url: String) -> String {
@@ -415,4 +444,5 @@ struct HomeView: View {
 
 #Preview {
     HomeView()
+        .environmentObject(ConnectionCoordinator.shared)
 }

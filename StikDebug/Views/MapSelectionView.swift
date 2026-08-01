@@ -724,6 +724,8 @@ final class LocationSearchCompleter: NSObject, ObservableObject, MKLocalSearchCo
 }
 
 struct LocationSimulationView: View {
+    @EnvironmentObject private var coordinator: ConnectionCoordinator
+
     @State private var coordinate: CLLocationCoordinate2D?
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
 
@@ -1329,20 +1331,37 @@ struct LocationSimulationView: View {
     private func runLocationCommand(
         errorTitle: String,
         errorMessage: @escaping (Int32) -> String,
+        requiresConnection: Bool = true,
         operation: @escaping () -> Int32,
         onSuccess: @escaping () -> Void
     ) {
         isBusy = true
-        LocationSimulationCommandQueue.shared.async {
-            let code = operation()
-            DispatchQueue.main.async {
-                isBusy = false
-                if code == 0 {
-                    onSuccess()
-                } else {
-                    alertTitle = errorTitle
-                    alertMessage = errorMessage(code)
-                    showAlert = true
+
+        Task { @MainActor in
+            // Connect here, when the user actually asks for a simulation — not at
+            // launch. This is what makes Location Simulation usable on a device that
+            // cannot reach the debug services at all.
+            if requiresConnection {
+                do {
+                    try await coordinator.ensureReady(.tunnelAndDDI, userInitiated: true)
+                } catch {
+                    isBusy = false
+                    // The coordinator already surfaced exactly one alert for this.
+                    return
+                }
+            }
+
+            LocationSimulationCommandQueue.shared.async {
+                let code = operation()
+                DispatchQueue.main.async {
+                    isBusy = false
+                    if code == 0 {
+                        onSuccess()
+                    } else {
+                        alertTitle = errorTitle
+                        alertMessage = errorMessage(code)
+                        showAlert = true
+                    }
                 }
             }
         }
@@ -1359,6 +1378,9 @@ struct LocationSimulationView: View {
         runLocationCommand(
             errorTitle: "Clear Failed",
             errorMessage: { code in "Could not clear simulated location (error \(code))." },
+            // Clearing acts on the already-open channel; it must not drag the user
+            // through a fresh connection attempt just to stop a simulation.
+            requiresConnection: false,
             operation: clear_simulated_location
         ) {
             endBackgroundTask()

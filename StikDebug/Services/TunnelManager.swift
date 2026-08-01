@@ -5,122 +5,33 @@
 
 import Foundation
 
+/// Compatibility facade over `DeviceTransport` and `ConnectionCoordinator`.
+///
+/// Connection state now lives in `DeviceTransport` and the connect/mount sequence in
+/// `ConnectionCoordinator`. This type stays because several call sites read
+/// `isConnected` or ask for a background reconnect; it no longer presents any UI and
+/// no longer triggers the DDI mount, which is what used to produce a second alert on
+/// top of the first.
 final class TunnelManager: ObservableObject {
     static let shared = TunnelManager()
 
-    @Published private(set) var isConnected = false
-
-    private var isStarting = false
-
     private init() {}
 
+    var isConnected: Bool {
+        DeviceTransport.shared.isConnected
+    }
+
+    var activeTransport: DeviceTransportKind? {
+        DeviceTransport.shared.activeKind
+    }
+
     func markDisconnected() {
-        runOnMain {
-            self.isConnected = false
-        }
+        ConnectionCoordinator.shared.invalidate()
     }
 
     func start(showErrorUI: Bool = true) {
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async {
-                self.start(showErrorUI: showErrorUI)
-            }
-            return
-        }
-
-        let pairingFileURL = PairingFileStore.prepareURL()
-        guard FileManager.default.fileExists(atPath: pairingFileURL.path) else {
-            isConnected = false
-            return
-        }
-
-        guard !isStarting else {
-            return
-        }
-
-        isStarting = true
-
-        DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
-            let result: Result<Void, NSError>
-            do {
-                try JITEnableContext.shared.startTunnel()
-                result = .success(())
-            } catch {
-                result = .failure(error as NSError)
-            }
-
-            DispatchQueue.main.async {
-                self.finishStart(result, showErrorUI: showErrorUI)
-            }
-        }
-    }
-
-    private func finishStart(_ result: Result<Void, NSError>, showErrorUI: Bool) {
-        isStarting = false
-
-        switch result {
-        case .success:
-            isConnected = true
-            LogManager.shared.addInfoLog("Tunnel connected successfully")
-            mountDeveloperDiskImageIfNeeded()
-        case .failure(let error):
-            isConnected = false
-            handleStartFailure(error, showErrorUI: showErrorUI)
-        }
-    }
-
-    private func mountDeveloperDiskImageIfNeeded() {
-        let trustcachePath = URL.documentsDirectory.appendingPathComponent("DDI/Image.dmg.trustcache").path
-        guard FileManager.default.fileExists(atPath: trustcachePath),
-              !MountingProgress.shared.coolisMounted,
-              MountingProgress.shared.mountingThread == nil else {
-            return
-        }
-        MountingProgress.shared.pubMount()
-    }
-
-    private func handleStartFailure(_ error: NSError, showErrorUI: Bool) {
-        LogManager.shared.addErrorLog(tunnelConnectionLogMessage(for: error))
-        guard showErrorUI else {
-            return
-        }
-
-        if error.code == -9 {
-            handleInvalidPairingFile()
-            return
-        }
-
-        showAlert(
-            title: "Connection Error",
-            message: tunnelConnectionAlertMessage(for: error),
-            showOk: false,
-            showTryAgain: true
-        ) { shouldTryAgain in
-            if shouldTryAgain {
-                startTunnelInBackground()
-            }
-        }
-    }
-
-    private func handleInvalidPairingFile() {
-        LogManager.shared.addInfoLog("Pairing file reported invalid; keeping existing file")
-
-        showAlert(
-            title: "Invalid Pairing File",
-            message: "The pairing file may be invalid or expired. You can import a new pairing file to replace it.",
-            showOk: true,
-            showTryAgain: false,
-            primaryButtonText: "Select New File"
-        ) { _ in
-            NotificationCenter.default.post(name: NSNotification.Name("ShowPairingFilePicker"), object: nil)
-        }
-    }
-
-    private func runOnMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.async(execute: work)
+        Task {
+            try? await ConnectionCoordinator.shared.ensureReady(.tunnelOnly, userInitiated: showErrorUI)
         }
     }
 }
@@ -133,78 +44,98 @@ func markTunnelDisconnected() {
     TunnelManager.shared.markDisconnected()
 }
 
-private func tunnelConnectionLogMessage(for error: NSError) -> String {
-    let target = "\(DeviceConnectionContext.targetIPAddress):49152"
-    return "Tunnel connection failed for \(target): \(error.localizedDescription) (Domain: \(error.domain), Code: \(error.code), Raw: \(String(describing: error)))"
-}
+/// Turns a transport error into something a person can act on.
+///
+/// The transport layer reports one combined error when every path failed, so this
+/// produces a single message covering all of them instead of one alert per attempt.
+enum ConnectionDiagnostics {
+    static func explain(_ error: NSError) -> String {
+        let targetIP = DeviceConnectionContext.targetIPAddress
+        let rawMessage = error.localizedDescription
+        let lowercased = rawMessage.lowercased()
 
-private func tunnelConnectionAlertMessage(for error: NSError) -> String {
-    let targetIP = DeviceConnectionContext.targetIPAddress
-    let rawMessage = error.localizedDescription
-    let lowercasedMessage = rawMessage.lowercased()
+        let likelyCause: String
+        var recoverySteps: [String]
 
-    let likelyCause: String
-    let recoverySteps: [String]
+        if lowercased.contains("connection refused") || error.code == 61 {
+            likelyCause = """
+            The device answered but nothing is listening on the developer port.
 
-    if error.code == 48 || lowercasedMessage.contains("address already in use") || lowercasedMessage.contains("port already in use") {
-        likelyCause = "A port needed for the tunnel is already in use."
-        recoverySteps = [
-            "Close other JIT, debugging, proxy, or VPN apps that may be using the tunnel.",
-            "Disconnect and reconnect LocalDevVPN.",
-            "Restart StikDebug, then try again.",
-            "If it keeps happening, reboot the device to clear the stuck port."
-        ]
-    } else if error.code == 54 || lowercasedMessage.contains("connection reset") {
-        likelyCause = "The device or VPN closed the tunnel connection before setup finished."
-        recoverySteps = [
-            "Open LocalDevVPN and confirm the VPN is connected.",
-            "Make sure LocalDevVPN is using the default \(DeviceConnectionContext.defaultTargetIPAddress) address.",
-            "Reconnect Wi-Fi and LocalDevVPN, then try again.",
-            "If this keeps happening, select a fresh pairing file."
-        ]
-    } else if error.code == -18 || lowercasedMessage.contains("parse target ip") {
-        likelyCause = "The configured target IP address is not valid."
-        recoverySteps = [
-            "Open Settings and check the target IP address.",
-            "Use the default \(DeviceConnectionContext.defaultTargetIPAddress)."
-        ]
-    } else if lowercasedMessage.contains("timed out") || lowercasedMessage.contains("timeout") {
-        likelyCause = "The app could not reach the device before the connection timed out."
-        recoverySteps = [
-            "Confirm Wi-Fi and LocalDevVPN are both connected.",
-            "Wake and unlock the target device.",
-            "Confirm LocalDevVPN is exposing the device at \(targetIP)."
-        ]
-    } else if lowercasedMessage.contains("network is unreachable") || lowercasedMessage.contains("no route") {
-        likelyCause = "The VPN route to the device is not available."
-        recoverySteps = [
-            "Disconnect and reconnect LocalDevVPN.",
-            "Confirm iOS shows the VPN indicator.",
-            "Try switching Wi-Fi off and on."
-        ]
-    } else {
-        likelyCause = "The tunnel could not be created."
-        recoverySteps = [
-            "Confirm Wi-Fi and LocalDevVPN are connected.",
-            "Wake and unlock the target device.",
-            "Reconnect LocalDevVPN, then try again."
-        ]
+            iOS only starts its developer network services while the device is joined \
+            to a Wi-Fi network as a client. Cellular alone does not start them, and \
+            neither does Personal Hotspot — in hotspot mode the Wi-Fi chip runs as an \
+            access point, which is not the same thing.
+            """
+            recoverySteps = [
+                "Join any Wi-Fi network — it does not need internet access.",
+                "Once connected, the session stays alive if you switch back to cellular.",
+                "If you are already on Wi-Fi, unlock the device and try again."
+            ]
+        } else if lowercased.contains("timed out") || lowercased.contains("timeout") || error.code == 60 {
+            likelyCause = "No reply from \(targetIP). The route to the device is missing."
+            recoverySteps = [
+                "Open LocalDevVPN and confirm the VPN is connected.",
+                "Confirm LocalDevVPN exposes the device at \(DeviceConnectionContext.defaultTargetIPAddress).",
+                "Reconnect the VPN, then try again."
+            ]
+        } else if lowercased.contains("network is unreachable") || lowercased.contains("no route") {
+            likelyCause = "The VPN route to the device is not available."
+            recoverySteps = [
+                "Disconnect and reconnect LocalDevVPN.",
+                "Confirm iOS shows the VPN indicator.",
+                "Try switching Wi-Fi off and on."
+            ]
+        } else if error.code == 48 || lowercased.contains("address already in use") {
+            likelyCause = "A port needed for the tunnel is already in use."
+            recoverySteps = [
+                "Close other JIT, debugging, proxy, or VPN apps.",
+                "Disconnect and reconnect LocalDevVPN.",
+                "Reboot the device if it keeps happening."
+            ]
+        } else if error.code == 54 || lowercased.contains("connection reset") {
+            likelyCause = "The device closed the connection before setup finished."
+            recoverySteps = [
+                "Unlock the device and try again.",
+                "Reconnect LocalDevVPN.",
+                "If this keeps happening, import a fresh pairing file."
+            ]
+        } else if error.code == -18 || lowercased.contains("valid ipv4") {
+            likelyCause = "The configured target IP address is not valid."
+            recoverySteps = [
+                "Open Settings and check the target IP address.",
+                "Use the default \(DeviceConnectionContext.defaultTargetIPAddress)."
+            ]
+        } else if lowercased.contains("lockdown pair record") {
+            likelyCause = """
+            The pairing file works for the Wi-Fi transport but is not a lockdown pair \
+            record, so the cellular-capable transport cannot use it.
+            """
+            recoverySteps = [
+                "Re-create the pairing file with the device connected over USB.",
+                "Import it again under Settings."
+            ]
+        } else {
+            likelyCause = "The tunnel could not be created."
+            recoverySteps = [
+                "Confirm LocalDevVPN is connected.",
+                "Unlock the device.",
+                "Try again."
+            ]
+        }
+
+        let steps = recoverySteps.enumerated()
+            .map { "\($0.offset + 1). \($0.element)" }
+            .joined(separator: "\n")
+
+        return """
+        \(likelyCause)
+
+        Try this:
+        \(steps)
+
+        Technical details
+        Target: \(targetIP)
+        \(rawMessage)
+        """
     }
-
-    let steps = recoverySteps.enumerated()
-        .map { "\($0.offset + 1). \($0.element)" }
-        .joined(separator: "\n")
-
-    return """
-    \(likelyCause)
-
-    Target: \(targetIP):49152
-    Expected LocalDevVPN IP: \(DeviceConnectionContext.defaultTargetIPAddress)
-
-    Try this:
-    \(steps)
-
-    Technical details:
-    Code \(error.code): \(rawMessage)
-    """
 }

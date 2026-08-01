@@ -19,6 +19,20 @@ struct SettingsView: View {
     @AppStorage("keepAliveAudio") private var keepAliveAudio = true
     @AppStorage("keepAliveLocation") private var keepAliveLocation = true
     @AppStorage(UserDefaults.Keys.targetDeviceIP) private var targetDeviceIP = DeviceConnectionContext.defaultTargetIPAddress
+    @AppStorage(UserDefaults.Keys.autoConnectOnLaunch) private var autoConnectOnLaunch = true
+    @AppStorage(UserDefaults.Keys.transportOverride) private var transportOverrideSelection = "auto"
+
+    /// Explains what pinning a transport means, so the picker is not a mystery knob.
+    private var transportFooter: String {
+        switch DeviceTransportKind(rawValue: transportOverrideSelection) {
+        case .remotePairing:
+            return "Pinned to RemotePairing on port \(DeviceTransportKind.remotePairing.port). Requires the device to be joined to a Wi-Fi network as a client."
+        case .coreDeviceProxy:
+            return "Pinned to CoreDeviceProxy via lockdownd on port \(DeviceTransportKind.coreDeviceProxy.port). Does not depend on a Wi-Fi association."
+        case nil:
+            return "Tries both routes to the device and keeps whichever works. Pin one only to isolate a problem."
+        }
+    }
 
     @State private var isShowingPairingFilePicker = false
     @State private var isImportingFile = false
@@ -131,6 +145,28 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    Toggle(isOn: $autoConnectOnLaunch) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Connect on Launch")
+                            Text("Turn off if you only use Location Simulation. The connection is then built the first time you actually need it.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Picker("Transport", selection: $transportOverrideSelection) {
+                        Text("Automatic").tag("auto")
+                        ForEach(DeviceTransportKind.allCases) { kind in
+                            Text(kind.title).tag(kind.rawValue)
+                        }
+                    }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    Text(transportFooter)
+                }
+
                 Section("Advanced") {
                     HStack {
                         Text("Target Device IP")
@@ -197,7 +233,9 @@ struct SettingsView: View {
                     try PairingFileStore.importFromPicker(url, fileManager: fileManager)
                     isImportingFile = false
                     pairingImportMessage = ("Imported successfully", false)
-                    startTunnelInBackground()
+                    // New credentials invalidate the current session.
+                    ConnectionCoordinator.shared.invalidate()
+                    ConnectionCoordinator.shared.ensureReadyInBackground(.tunnelOnly)
                     schedulePairingStatusDismiss()
                 } catch {
                     isImportingFile = false

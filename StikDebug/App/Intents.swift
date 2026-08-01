@@ -296,10 +296,12 @@ struct StikDebugShortcuts: AppShortcutsProvider {
 
 // MARK: - Shared Tunnel Helper
 
+/// Brings the shared session up for an App Intent.
+///
+/// This used to tear the session down, kick off a reconnect and then sleep for a
+/// fixed second, hoping that was long enough. It now waits for the real thing and
+/// reuses a session that is already up, which matters because the session survives
+/// network handoffs and is expensive to rebuild.
 func ensureTunnel() async {
-    await MainActor.run {
-        markTunnelDisconnected()
-        startTunnelInBackground(showErrorUI: false)
-    }
-    try? await Task.sleep(nanoseconds: 1_000_000_000)
+    try? await ConnectionCoordinator.shared.ensureReady(.tunnelOnly, userInitiated: false)
 }
