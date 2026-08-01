@@ -21,6 +21,8 @@
 		<string>_stikdebug._tcp</string>
 		<string>_stikdebug._udp</string>
 	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>StikDebug uses the local network to reach this device's own developer services through the VPN tunnel, and to bring up a peer-to-peer link when no Wi-Fi network is available.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

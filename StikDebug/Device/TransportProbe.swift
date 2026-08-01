@@ -77,6 +77,13 @@ struct TransportProbeReport {
         interfaces.contains { $0 == "ap1" || $0.hasPrefix("bridge") }
     }
 
+    /// AWDL — the peer-to-peer Wi-Fi link behind AirDrop and AirPlay. It is a
+    /// link-local interface that carries mDNS and needs no network to join, which is
+    /// why it is worth knowing whether it is up.
+    var hasPeerToPeerInterface: Bool {
+        interfaces.contains { $0.hasPrefix("awdl") || $0.hasPrefix("llw") }
+    }
+
     func outcome(forPort port: UInt16) -> ProbeOutcome? {
         ports.first { $0.port == port }?.outcome
     }
@@ -98,9 +105,15 @@ struct TransportProbeReport {
                 + "The CoreDeviceProxy transport can reach RSD on this network."
         }
         if hasCellularInterface && !hasWiFiClientInterface {
-            return "Cellular only, and neither port answers. iOS starts developer network "
-                + "services only while the device is a Wi-Fi client — join any Wi-Fi network "
-                + "once to bring the tunnel up, then switch back."
+            if hasPeerToPeerInterface {
+                return "Cellular only with a peer-to-peer link up, and still neither port "
+                    + "answers. That rules out AWDL as a substitute for a Wi-Fi association: "
+                    + "iOS wants a real client association. Join any Wi-Fi network once to "
+                    + "bring the session up, then switch back — it survives the handoff."
+            }
+            return "Cellular only, and neither port answers. Before concluding anything, try "
+                + "the local link switch above with Wi-Fi powered on: if the gate is merely a "
+                + "local link rather than a Wi-Fi association, that is enough to open it."
         }
         return "Neither port answers. Check that LocalDevVPN targets \(targetIP) and that the "
             + "device is unlocked."
@@ -120,6 +133,7 @@ struct TransportProbeReport {
         lines.append("  Wi-Fi client: \(hasWiFiClientInterface ? "yes" : "no")")
         lines.append("  Cellular: \(hasCellularInterface ? "yes" : "no")")
         lines.append("  Access point mode: \(hasAccessPointInterface ? "yes" : "no")")
+        lines.append("  Peer-to-peer (AWDL): \(hasPeerToPeerInterface ? "yes" : "no")")
         lines.append("  Tunnel (utun): \(hasTunnelInterface ? "yes" : "no")")
         lines.append("")
         lines.append("Pairing record")

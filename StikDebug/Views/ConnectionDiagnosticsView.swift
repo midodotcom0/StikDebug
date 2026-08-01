@@ -14,12 +14,31 @@ import SwiftUI
 import UIKit
 
 struct ConnectionDiagnosticsView: View {
+    @ObservedObject private var localLink = LocalLinkActivator.shared
+
     @State private var report: TransportProbeReport?
     @State private var isRunning = false
     @State private var didCopy = false
 
     var body: some View {
         List {
+            Section {
+                Toggle("Local Link (AWDL)", isOn: Binding(
+                    get: { localLink.isActive },
+                    set: { $0 ? localLink.start() : localLink.stop() }
+                ))
+
+                if let error = localLink.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Experiment")
+            } footer: {
+                Text("Opens a peer-to-peer Bonjour listener, which asks iOS to bring up AWDL — a local link that needs no Wi-Fi network to join, only the radio powered on. If the device's developer services gate on \"a local link exists\" rather than \"joined to an access point\", this opens them on cellular. Turn it on, wait a few seconds, then run the diagnostics below and compare.")
+            }
+
             Section {
                 Button {
                     runProbe()
@@ -63,6 +82,7 @@ struct ConnectionDiagnosticsView: View {
                     LabeledContent("Wi-Fi client", value: report.hasWiFiClientInterface ? "yes" : "no")
                     LabeledContent("Cellular", value: report.hasCellularInterface ? "yes" : "no")
                     LabeledContent("Access point mode", value: report.hasAccessPointInterface ? "yes" : "no")
+                    LabeledContent("Peer-to-peer (AWDL)", value: report.hasPeerToPeerInterface ? "yes" : "no")
                     LabeledContent("VPN tunnel", value: report.hasTunnelInterface ? "yes" : "no")
                     LabeledContent("Interfaces", value: report.interfaces.joined(separator: ", "))
                         .font(.caption)
