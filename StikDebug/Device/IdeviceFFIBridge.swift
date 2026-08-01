@@ -779,27 +779,48 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
 
     defer { rp_pairing_file_free(pairingHandle) }
 
-    let discoveryLease = try? RemotePairingEndpointResolver.resolve()
-    let endpoint = discoveryLease?.endpoint ?? RemotePairingEndpoint(host: deviceIP, port: 49152)
+    var discoveryLease = try? RemotePairingEndpointResolver.resolve()
+    var endpoint = discoveryLease?.endpoint ?? RemotePairingEndpoint(host: deviceIP, port: 49152)
 
-    let providerError: UnsafeMutablePointer<IdeviceFfiError>?
+    func createProvider() throws -> UnsafeMutablePointer<IdeviceFfiError>? {
+        try DeviceSocketAddress.withSockAddr(endpoint: endpoint) { address, addressLength in
+            tunnel_create_rppairing(
+                address,
+                addressLength,
+                "StikDebugLocation",
+                pairingHandle,
+                nil,
+                nil,
+                &LocationSimulationState.adapter,
+                &LocationSimulationState.handshake
+            )
+        }
+    }
+
+    var providerError: UnsafeMutablePointer<IdeviceFfiError>?
     do {
-        providerError = try withExtendedLifetime(discoveryLease) {
-            try DeviceSocketAddress.withSockAddr(endpoint: endpoint) { address, addressLength in
-                tunnel_create_rppairing(
-                    address,
-                    addressLength,
-                    "StikDebugLocation",
-                    pairingHandle,
-                    nil,
-                    nil,
-                    &LocationSimulationState.adapter,
-                    &LocationSimulationState.handshake
-                )
-            }
+        providerError = try withExtendedLifetime(discoveryLease) { try createProvider() }
+
+        if providerError != nil, discoveryLease != nil {
+            idevice_error_free(providerError)
+            LocationSimulationState.cleanup()
+            discoveryLease = nil
+            endpoint = RemotePairingEndpoint(host: deviceIP, port: 49152)
+            providerError = try createProvider()
         }
     } catch {
-        return LocationSimulationStatus.invalidIP
+        if discoveryLease != nil {
+            LocationSimulationState.cleanup()
+            discoveryLease = nil
+            endpoint = RemotePairingEndpoint(host: deviceIP, port: 49152)
+            do {
+                providerError = try createProvider()
+            } catch {
+                return LocationSimulationStatus.invalidIP
+            }
+        } else {
+            return LocationSimulationStatus.invalidIP
+        }
     }
 
     if let providerError {

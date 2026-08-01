@@ -144,26 +144,40 @@ final class JITEnableContext {
         let pairingFile = try getPairingFile()
         defer { rp_pairing_file_free(pairingFile) }
 
+        var peerToPeerError: NSError?
         if let discovered = try? RemotePairingEndpointResolver.resolve() {
-            return try withExtendedLifetime(discovered) {
-                var tunnel = try createTunnel(
-                    hostname: hostname,
-                    pairingFile: pairingFile,
-                    endpoint: discovered.endpoint
-                )
-                tunnel.endpointLease = discovered
-                return tunnel
+            do {
+                return try withExtendedLifetime(discovered) {
+                    var tunnel = try createTunnel(
+                        hostname: hostname,
+                        pairingFile: pairingFile,
+                        endpoint: discovered.endpoint
+                    )
+                    tunnel.endpointLease = discovered
+                    return tunnel
+                }
+            } catch let error as NSError {
+                peerToPeerError = error
+                routeLog("Direct peer-to-peer tunnel failed; trying configured VPN target: \(error.localizedDescription)")
             }
         }
 
-        return try createTunnel(
-            hostname: hostname,
-            pairingFile: pairingFile,
-            endpoint: RemotePairingEndpoint(
-                host: DeviceConnectionContext.targetIPAddress,
-                port: 49152
+        do {
+            return try createTunnel(
+                hostname: hostname,
+                pairingFile: pairingFile,
+                endpoint: RemotePairingEndpoint(
+                    host: DeviceConnectionContext.targetIPAddress,
+                    port: 49152
+                )
             )
-        )
+        } catch let vpnError as NSError {
+            guard let peerToPeerError else { throw vpnError }
+            throw makeError(
+                "Direct peer-to-peer failed: \(peerToPeerError.localizedDescription)\n\nConfigured VPN target failed: \(vpnError.localizedDescription)",
+                code: vpnError.code
+            )
+        }
     }
 
     private func createTunnel(
