@@ -83,7 +83,6 @@ enum PairingFileStore {
 
     private static var legacyURLs: [URL] {
         [
-            // Preserve existing installs that used the former internal filename.
             directoryURL.appendingPathComponent(legacyFileName),
             documentsURL,
             URL.documentsDirectory.appendingPathComponent(legacyFileName)
