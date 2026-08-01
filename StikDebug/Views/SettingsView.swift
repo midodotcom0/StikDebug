@@ -28,6 +28,7 @@ struct SettingsView: View {
     @State private var ddiDownloadProgress: Double = 0.0
     @State private var ddiStatusMessage: String = ""
     @State private var ddiResultMessage: (text: String, isError: Bool)?
+    @StateObject private var lockdownProbe = LockdownReachabilityProbe()
 
     private var appVersion: String {
         let marketingVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -143,6 +144,31 @@ struct SettingsView: View {
                             .keyboardType(.numbersAndPunctuation)
                             .frame(maxWidth: 160)
                     }
+                    Button {
+                        lockdownProbe.start(host: targetDeviceIP)
+                    } label: {
+                        HStack {
+                            Label("Test Lockdown Port 62078", systemImage: "network")
+                            Spacer()
+                            if lockdownProbe.status.isRunning {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                        }
+                    }
+                    .foregroundStyle(.primary)
+                    .disabled(lockdownProbe.status.isRunning)
+
+                    if lockdownProbe.status != .idle {
+                        Label(lockdownProbeMessage, systemImage: lockdownProbeSymbol)
+                            .font(.caption)
+                            .foregroundStyle(lockdownProbeColor)
+                    }
+
+                    Text("Reachability only. This test does not read or transmit pairing data.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
                     Button { openAppFolder() } label: {
                         Label("App Folder", systemImage: "folder")
                     }.foregroundStyle(.primary)
@@ -229,6 +255,47 @@ struct SettingsView: View {
             txmLabel = processInfo.hasTXM ? "TXM" : "Non TXM"
         }
         return "Version \(appVersion) • iOS \(UIDevice.current.systemVersion) • \(txmLabel)"
+    }
+
+    private var lockdownProbeMessage: String {
+        switch lockdownProbe.status {
+        case .idle:
+            return ""
+        case .running(let host):
+            return "Connecting to \(host):62078…"
+        case .reachable(let host):
+            return "Success: \(host):62078 accepts TCP connections."
+        case .refused(let host):
+            return "Refused: \(host) responded, but nothing accepts TCP connections on port 62078."
+        case .timedOut(let host):
+            return "Timeout: no TCP response from \(host):62078 within 5 seconds."
+        case .invalidAddress:
+            return "Enter a numeric IPv4 or IPv6 target address first."
+        case .failed(let host, let reason):
+            return "Failed to reach \(host):62078: \(reason)"
+        }
+    }
+
+    private var lockdownProbeSymbol: String {
+        switch lockdownProbe.status {
+        case .idle, .running:
+            return "network"
+        case .reachable:
+            return "checkmark.circle.fill"
+        case .refused, .timedOut, .invalidAddress, .failed:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var lockdownProbeColor: Color {
+        switch lockdownProbe.status {
+        case .idle, .running:
+            return .secondary
+        case .reachable:
+            return .green
+        case .refused, .timedOut, .invalidAddress, .failed:
+            return .orange
+        }
     }
 
     // MARK: - Business Logic
