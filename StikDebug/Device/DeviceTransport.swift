@@ -224,27 +224,6 @@ final class DeviceTransport {
         throw TransportError.allTransportsFailed(attempts)
     }
 
-    /// Runs `body` with a live RSD session, connecting first if necessary.
-    ///
-    /// `body` is called outside the state lock so long-running consumers (the syslog
-    /// relay in particular) cannot block other callers.
-    func withRSD<T>(
-        isCancelled: () -> Bool = { false },
-        _ body: (OpaquePointer, OpaquePointer) throws -> T
-    ) throws -> T {
-        try connectIfNeeded(isCancelled: isCancelled)
-
-        stateLock.lock()
-        let current = handles
-        stateLock.unlock()
-
-        guard let adapter = current.adapter, let handshake = current.handshake else {
-            throw TransportError.notConnected
-        }
-
-        return try body(adapter, handshake)
-    }
-
     /// Runs `body` with the DVT location simulation channel, opening it if needed.
     ///
     /// `body` runs while `stateLock` is held. That is deliberate: it makes it
