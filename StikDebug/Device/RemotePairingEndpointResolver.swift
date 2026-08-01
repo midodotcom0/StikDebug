@@ -1,0 +1,258 @@
+//
+//  RemotePairingEndpointResolver.swift
+//  StikDebug
+//
+//  Resolves the device's Bonjour-advertised RemotePairing endpoint and keeps
+//  its peer-to-peer route alive while the native tunnel opens a second socket.
+//
+
+import Darwin
+import Foundation
+import Network
+
+struct RemotePairingEndpoint: Equatable, Sendable {
+    let host: String
+    let port: UInt16
+    let interfaceName: String?
+
+    init(host: String, port: UInt16, interfaceName: String? = nil) {
+        let trimmedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+
+        if let percent = trimmedHost.lastIndex(of: "%") {
+            self.host = String(trimmedHost[..<percent])
+            let scope = String(trimmedHost[trimmedHost.index(after: percent)...])
+            self.interfaceName = scope.isEmpty ? interfaceName : scope
+        } else {
+            self.host = trimmedHost
+            self.interfaceName = interfaceName
+        }
+        self.port = port
+    }
+
+    var displayName: String {
+        let scopedHost = interfaceName.map { "\(host)%\($0)" } ?? host
+        return "\(scopedHost):\(port)"
+    }
+}
+
+final class RemotePairingEndpointLease {
+    let endpoint: RemotePairingEndpoint
+    private let browser: NWBrowser
+    private let anchorConnection: NWConnection
+
+    fileprivate init(
+        endpoint: RemotePairingEndpoint,
+        browser: NWBrowser,
+        anchorConnection: NWConnection
+    ) {
+        self.endpoint = endpoint
+        self.browser = browser
+        self.anchorConnection = anchorConnection
+    }
+
+    deinit {
+        browser.cancel()
+        anchorConnection.cancel()
+    }
+}
+
+enum RemotePairingEndpointResolver {
+    private static let serviceType = "_remotepairing._tcp"
+
+    static func resolve(timeout: TimeInterval = 6) throws -> RemotePairingEndpointLease {
+        let resolution = RemotePairingResolution(serviceType: serviceType)
+        resolution.start()
+        return try resolution.wait(timeout: timeout)
+    }
+}
+
+private final class RemotePairingResolution: @unchecked Sendable {
+    private let serviceType: String
+    private let queue = DispatchQueue(label: "com.stik.stikdebug.remote-pairing-resolver")
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+
+    private var browser: NWBrowser?
+    private var connection: NWConnection?
+    private var result: Result<RemotePairingEndpoint, NSError>?
+    private var completed = false
+
+    init(serviceType: String) {
+        self.serviceType = serviceType
+    }
+
+    func start() {
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: parameters)
+        self.browser = browser
+
+        browser.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .failed(let error) = state {
+                self.complete(.failure(self.makeError("Remote Pairing discovery failed: \(error.localizedDescription)")))
+            }
+        }
+
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self, let serviceEndpoint = results.first?.endpoint,
+                  self.connection == nil else { return }
+
+            let advertisedInterface: String?
+            if case .service(_, _, _, let interface) = serviceEndpoint {
+                advertisedInterface = interface?.name
+            } else {
+                advertisedInterface = nil
+            }
+
+            let parameters = NWParameters.tcp
+            parameters.includePeerToPeer = true
+            let connection = NWConnection(to: serviceEndpoint, using: parameters)
+            self.connection = connection
+
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                guard let self, let connection else { return }
+
+                switch state {
+                case .ready:
+                    guard case .hostPort(let host, let port) = connection.currentPath?.remoteEndpoint else {
+                        self.complete(.failure(self.makeError("Remote Pairing resolved without a numeric endpoint.")))
+                        return
+                    }
+                    self.complete(.success(RemotePairingEndpoint(
+                        host: String(describing: host),
+                        port: port.rawValue,
+                        interfaceName: advertisedInterface
+                    )))
+                case .failed(let error):
+                    self.complete(.failure(self.makeError("Remote Pairing endpoint failed: \(error.localizedDescription)")))
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: self.queue)
+        }
+
+        browser.start(queue: queue)
+    }
+
+    func wait(timeout: TimeInterval) throws -> RemotePairingEndpointLease {
+        let waitResult = semaphore.wait(timeout: .now() + max(timeout, 0))
+        guard waitResult == .success else {
+            queue.sync { cancelAllOnQueue() }
+            throw makeError("No Remote Pairing service was found within \(Int(timeout)) seconds.")
+        }
+
+        lock.lock()
+        let finalResult = result
+        lock.unlock()
+
+        let resources: (browser: NWBrowser?, anchor: NWConnection?) = queue.sync {
+            let resources = (browser, connection)
+            browser = nil
+            connection = nil
+            return resources
+        }
+
+        guard let finalResult else {
+            resources.browser?.cancel()
+            resources.anchor?.cancel()
+            throw makeError("Remote Pairing discovery ended without a result.")
+        }
+
+        switch finalResult {
+        case .success(let endpoint):
+            guard let browser = resources.browser, let anchor = resources.anchor else {
+                throw makeError("Remote Pairing route was lost before tunnel setup.")
+            }
+            return RemotePairingEndpointLease(
+                endpoint: endpoint,
+                browser: browser,
+                anchorConnection: anchor
+            )
+        case .failure(let error):
+            resources.browser?.cancel()
+            resources.anchor?.cancel()
+            throw error
+        }
+    }
+
+    private func complete(_ newResult: Result<RemotePairingEndpoint, NSError>) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        result = newResult
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    private func cancelAllOnQueue() {
+        browser?.cancel()
+        browser = nil
+        connection?.cancel()
+        connection = nil
+    }
+
+    private func makeError(_ message: String) -> NSError {
+        NSError(
+            domain: "StikDebug.RemotePairingDiscovery",
+            code: -19,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+}
+
+enum DeviceSocketAddress {
+    static func withSockAddr<Result>(
+        endpoint: RemotePairingEndpoint,
+        _ body: (UnsafePointer<sockaddr>, socklen_t) -> Result
+    ) throws -> Result {
+        var ipv4 = sockaddr_in()
+        let ipv4Result = endpoint.host.withCString { inet_pton(AF_INET, $0, &ipv4.sin_addr) }
+        if ipv4Result == 1 {
+            ipv4.sin_len = UInt8(MemoryLayout<sockaddr_in>.stride)
+            ipv4.sin_family = sa_family_t(AF_INET)
+            ipv4.sin_port = in_port_t(endpoint.port).bigEndian
+            return withUnsafePointer(to: &ipv4) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    body($0, socklen_t(MemoryLayout<sockaddr_in>.stride))
+                }
+            }
+        }
+
+        var ipv6 = sockaddr_in6()
+        let ipv6Result = endpoint.host.withCString { inet_pton(AF_INET6, $0, &ipv6.sin6_addr) }
+        guard ipv6Result == 1 else {
+            throw NSError(
+                domain: "StikDebug.RemotePairingDiscovery",
+                code: -18,
+                userInfo: [NSLocalizedDescriptionKey: "Remote Pairing returned an invalid numeric address."]
+            )
+        }
+
+        ipv6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.stride)
+        ipv6.sin6_family = sa_family_t(AF_INET6)
+        ipv6.sin6_port = in_port_t(endpoint.port).bigEndian
+        if let interfaceName = endpoint.interfaceName {
+            let interfaceIndex = if_nametoindex(interfaceName)
+            guard interfaceIndex != 0 else {
+                throw NSError(
+                    domain: "StikDebug.RemotePairingDiscovery",
+                    code: -18,
+                    userInfo: [NSLocalizedDescriptionKey: "Remote Pairing returned an unknown network interface."]
+                )
+            }
+            ipv6.sin6_scope_id = interfaceIndex
+        }
+
+        return withUnsafePointer(to: &ipv6) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                body($0, socklen_t(MemoryLayout<sockaddr_in6>.stride))
+            }
+        }
+    }
+}
