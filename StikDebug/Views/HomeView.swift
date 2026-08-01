@@ -93,7 +93,9 @@ struct HomeView: View {
     }
 
     private func handleAppear() {
-        startTunnelInBackground()
+        // Keep the UI usable when the developer service is unavailable (for
+        // example on cellular). Feature actions still surface their own errors.
+        startTunnelInBackground(showErrorUI: false)
         MountingProgress.shared.checkforMounted()
         hasAppeared = true
 
