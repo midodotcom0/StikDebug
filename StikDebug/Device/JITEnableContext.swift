@@ -20,6 +20,7 @@ final class JITEnableContext {
     private struct TunnelHandles {
         var adapter: OpaquePointer?
         var handshake: OpaquePointer?
+        var endpointLease: RemotePairingEndpointLease?
 
         mutating func free() {
             if let handshake {
@@ -30,11 +31,13 @@ final class JITEnableContext {
                 adapter_free(adapter)
                 self.adapter = nil
             }
+            endpointLease = nil
         }
     }
 
     private var adapter: OpaquePointer?
     private var handshake: OpaquePointer?
+    private var endpointLease: RemotePairingEndpointLease?
 
     private let tunnelLock = NSLock()
     private var tunnelConnecting = false
@@ -69,6 +72,7 @@ final class JITEnableContext {
         if let adapter {
             adapter_free(adapter)
         }
+        endpointLease = nil
     }
 
     private func makeError(_ message: String, code: Int = -1) -> NSError {
@@ -140,23 +144,39 @@ final class JITEnableContext {
         let pairingFile = try getPairingFile()
         defer { rp_pairing_file_free(pairingFile) }
 
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(49152).bigEndian
-
-        let deviceIP = DeviceConnectionContext.targetIPAddress
-        let parseResult = deviceIP.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
-        guard parseResult == 1 else {
-            throw makeError("Failed to parse target IP address.", code: -18)
+        if let discovered = try? RemotePairingEndpointResolver.resolve() {
+            return try withExtendedLifetime(discovered) {
+                var tunnel = try createTunnel(
+                    hostname: hostname,
+                    pairingFile: pairingFile,
+                    endpoint: discovered.endpoint
+                )
+                tunnel.endpointLease = discovered
+                return tunnel
+            }
         }
 
+        return try createTunnel(
+            hostname: hostname,
+            pairingFile: pairingFile,
+            endpoint: RemotePairingEndpoint(
+                host: DeviceConnectionContext.targetIPAddress,
+                port: 49152
+            )
+        )
+    }
+
+    private func createTunnel(
+        hostname: String,
+        pairingFile: OpaquePointer,
+        endpoint: RemotePairingEndpoint
+    ) throws -> TunnelHandles {
         var tunnel = TunnelHandles()
-        let ffiError = hostname.withCString { hostname in
-            withUnsafePointer(to: &addr) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        let ffiError = try DeviceSocketAddress.withSockAddr(endpoint: endpoint) { address, addressLength in
+            hostname.withCString { hostname in
                     tunnel_create_rppairing(
-                        $0,
-                        socklen_t(MemoryLayout<sockaddr_in>.stride),
+                        address,
+                        addressLength,
                         hostname,
                         pairingFile,
                         nil,
@@ -164,7 +184,6 @@ final class JITEnableContext {
                         &tunnel.adapter,
                         &tunnel.handshake
                     )
-                }
             }
         }
 
@@ -205,6 +224,7 @@ final class JITEnableContext {
 
         var newAdapter: OpaquePointer?
         var newHandshake: OpaquePointer?
+        var newEndpointLease: RemotePairingEndpointLease?
         var finalError: NSError?
 
         defer {
@@ -220,6 +240,7 @@ final class JITEnableContext {
             let newTunnel = try createTunnel(hostname: "StikDebug")
             newAdapter = newTunnel.adapter
             newHandshake = newTunnel.handshake
+            newEndpointLease = newTunnel.endpointLease
         } catch let tunnelError as NSError {
             finalError = tunnelError
             throw tunnelError
@@ -231,9 +252,11 @@ final class JITEnableContext {
         if let adapter {
             adapter_free(adapter)
         }
+        endpointLease = nil
 
         adapter = newAdapter
         handshake = newHandshake
+        endpointLease = newEndpointLease
     }
 
     func ensureTunnel() throws {

@@ -729,6 +729,7 @@ private enum LocationSimulationState {
     static var handshake: OpaquePointer?
     static var remoteServer: OpaquePointer?
     static var locationSimulation: OpaquePointer?
+    static var endpointLease: RemotePairingEndpointLease?
 
     static func cleanup() {
         if let locationSimulation {
@@ -747,6 +748,7 @@ private enum LocationSimulationState {
             adapter_free(adapter)
             self.adapter = nil
         }
+        endpointLease = nil
     }
 }
 
@@ -764,15 +766,6 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         }
     }
 
-    var address = sockaddr_in()
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = in_port_t(49152).bigEndian
-
-    let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
-    guard inetResult == 1 else {
-        return LocationSimulationStatus.invalidIP
-    }
-
     var pairingHandle: OpaquePointer?
     let pairingError = pairingFile.withCString { rp_pairing_file_read($0, &pairingHandle) }
     if let pairingError {
@@ -786,19 +779,27 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
 
     defer { rp_pairing_file_free(pairingHandle) }
 
-    let providerError = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            tunnel_create_rppairing(
-                $0,
-                socklen_t(MemoryLayout<sockaddr_in>.stride),
-                "StikDebugLocation",
-                pairingHandle,
-                nil,
-                nil,
-                &LocationSimulationState.adapter,
-                &LocationSimulationState.handshake
-            )
+    let discoveryLease = try? RemotePairingEndpointResolver.resolve()
+    let endpoint = discoveryLease?.endpoint ?? RemotePairingEndpoint(host: deviceIP, port: 49152)
+
+    let providerError: UnsafeMutablePointer<IdeviceFfiError>?
+    do {
+        providerError = try withExtendedLifetime(discoveryLease) {
+            try DeviceSocketAddress.withSockAddr(endpoint: endpoint) { address, addressLength in
+                tunnel_create_rppairing(
+                    address,
+                    addressLength,
+                    "StikDebugLocation",
+                    pairingHandle,
+                    nil,
+                    nil,
+                    &LocationSimulationState.adapter,
+                    &LocationSimulationState.handshake
+                )
+            }
         }
+    } catch {
+        return LocationSimulationStatus.invalidIP
     }
 
     if let providerError {
@@ -806,6 +807,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.providerCreate
     }
+    LocationSimulationState.endpointLease = discoveryLease
 
     let remoteServerError = remote_server_connect_rsd(
         LocationSimulationState.adapter,
