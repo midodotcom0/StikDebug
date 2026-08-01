@@ -45,7 +45,11 @@ struct StikDebugApp: App {
     private func downloadMissingDeveloperDiskImageFiles() async {
         do {
             try await DeveloperDiskImageService.shared.downloadMissingFiles()
-            MountingProgress.shared.pubMount()
+            // Mounting requires a live tunnel. Trying it unconditionally at
+            // launch produces a second alert on top of the connection failure.
+            if TunnelManager.shared.isConnected {
+                MountingProgress.shared.pubMount()
+            }
         } catch {
             await MainActor.run {
                 showAlert(
