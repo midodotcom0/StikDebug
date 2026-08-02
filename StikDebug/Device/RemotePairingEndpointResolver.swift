@@ -71,8 +71,6 @@ enum RemotePairingEndpointResolver {
     fileprivate static func handoverParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
-        parameters.prohibitExpensivePath = false
-        parameters.prohibitConstrainedPath = false
         if #available(iOS 11.0, *) {
             parameters.multipathServiceType = .handover
         }
@@ -102,7 +100,7 @@ private final class RemotePairingResolution: @unchecked Sendable {
     }
 
     func start() {
-        let parameters = handoverParameters()
+        let parameters = RemotePairingEndpointResolver.handoverParameters()
         let browser = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: parameters)
         self.browser = browser
 
