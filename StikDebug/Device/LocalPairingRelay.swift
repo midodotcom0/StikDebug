@@ -32,7 +32,10 @@ final class LocalPairingRelay: @unchecked Sendable {
 
         func complete(_ value: Result<UInt16, NSError>) {
             lock.lock()
-            guard result == nil else { lock.unlock(); return }
+            guard result == nil else {
+                lock.unlock()
+                return
+            }
             result = value
             lock.unlock()
             semaphore.signal()
@@ -79,29 +82,34 @@ final class LocalPairingRelay: @unchecked Sendable {
         }
 
         func start() {
-            queue.async { [self] in
-                client.stateUpdateHandler = { [weak self] state in
-                    guard let self, !stopped else { return }
+            queue.async { [weak self] in
+                guard let self else { return }
+
+                self.client.stateUpdateHandler = { [weak self] state in
+                    guard let self, !self.stopped else { return }
                     switch state {
                     case .ready:
-                        clientReady = true
-                        startPumps()
+                        self.clientReady = true
+                        self.startPumps()
                     case .failed(let error):
-                        log("Relay client failed: \(error.localizedDescription)")
-                        stopNow()
+                        self.log("Relay client failed: \(error.localizedDescription)")
+                        self.stopNow()
                     case .cancelled:
-                        stopNow()
+                        self.stopNow()
                     default:
                         break
                     }
                 }
-                client.start(queue: queue)
-                tryNextSource()
+
+                self.client.start(queue: self.queue)
+                self.tryNextSource()
             }
         }
 
         func stop() {
-            queue.async { [self] in stopNow() }
+            queue.async { [weak self] in
+                self?.stopNow()
+            }
         }
 
         private func tryNextSource() {
@@ -138,21 +146,25 @@ final class LocalPairingRelay: @unchecked Sendable {
             serverReady = false
 
             connection.stateUpdateHandler = { [weak self, weak connection] state in
-                guard let self, let connection, !stopped,
-                      generation == attempt, server === connection else { return }
+                guard let self, let connection, !self.stopped,
+                      self.generation == attempt, self.server === connection else { return }
 
                 switch state {
                 case .ready:
-                    serverReady = true
-                    let actual = connection.currentPath?.localEndpoint.map { String(describing: $0) }
+                    self.serverReady = true
+                    let actual = connection.currentPath?.localEndpoint.map(String.init(describing:))
                         ?? source.address
-                    log("Relay connected from \(actual) via \(source.name) to \(target.displayName).")
-                    startPumps()
+                    self.log(
+                        "Relay connected from \(actual) via \(source.name) to \(self.target.displayName)."
+                    )
+                    self.startPumps()
                 case .failed(let error):
-                    log("Relay failed from \(source.address) on \(source.name): \(error.localizedDescription)")
+                    self.log(
+                        "Relay failed from \(source.address) on \(source.name): \(error.localizedDescription)"
+                    )
                     connection.cancel()
-                    server = nil
-                    tryNextSource()
+                    self.server = nil
+                    self.tryNextSource()
                 default:
                     break
                 }
@@ -160,12 +172,14 @@ final class LocalPairingRelay: @unchecked Sendable {
             connection.start(queue: queue)
 
             queue.asyncAfter(deadline: .now() + 3) { [weak self, weak connection] in
-                guard let self, let connection, !stopped,
-                      generation == attempt, server === connection, !serverReady else { return }
-                log("Relay timed out from \(source.address) on \(source.name).")
+                guard let self, let connection, !self.stopped,
+                      self.generation == attempt, self.server === connection,
+                      !self.serverReady else { return }
+
+                self.log("Relay timed out from \(source.address) on \(source.name).")
                 connection.cancel()
-                server = nil
-                tryNextSource()
+                self.server = nil
+                self.tryNextSource()
             }
         }
 
@@ -178,33 +192,47 @@ final class LocalPairingRelay: @unchecked Sendable {
 
         private func pump(from source: NWConnection, to destination: NWConnection) {
             guard !stopped else { return }
+
             source.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
                 [weak self] data, _, complete, error in
                 guard let self else { return }
-                queue.async {
-                    guard !stopped else { return }
+
+                self.queue.async { [weak self] in
+                    guard let self, !self.stopped else { return }
+
                     if let error {
-                        log("Relay receive failed: \(error.localizedDescription)")
-                        stopNow()
-                    } else if let data, !data.isEmpty {
-                        destination.send(content: data, completion: .contentProcessed { [weak self] error in
+                        self.log("Relay receive failed: \(error.localizedDescription)")
+                        self.stopNow()
+                        return
+                    }
+
+                    guard let data, !data.isEmpty else {
+                        if complete {
+                            self.stopNow()
+                        } else {
+                            self.pump(from: source, to: destination)
+                        }
+                        return
+                    }
+
+                    destination.send(
+                        content: data,
+                        completion: .contentProcessed { [weak self] sendError in
                             guard let self else { return }
-                            queue.async {
-                                if let error {
-                                    log("Relay send failed: \(error.localizedDescription)")
-                                    stopNow()
+
+                            self.queue.async { [weak self] in
+                                guard let self, !self.stopped else { return }
+                                if let sendError {
+                                    self.log("Relay send failed: \(sendError.localizedDescription)")
+                                    self.stopNow()
                                 } else if complete {
-                                    stopNow()
+                                    self.stopNow()
                                 } else {
-                                    pump(from: source, to: destination)
+                                    self.pump(from: source, to: destination)
                                 }
                             }
-                        })
-                    } else if complete {
-                        stopNow()
-                    } else {
-                        pump(from: source, to: destination)
-                    }
+                        }
+                    )
                 }
             }
         }
@@ -240,7 +268,9 @@ final class LocalPairingRelay: @unchecked Sendable {
         logger: @escaping (String) -> Void
     ) throws -> LocalPairingRelay {
         guard shouldAttempt(target: target) else {
-            throw relayError("Target is not a local IPv4 self-address, or no alternate source exists.")
+            throw relayError(
+                "Target is not a local IPv4 self-address, or no alternate source exists."
+            )
         }
 
         let parameters = NWParameters.tcp
@@ -260,15 +290,19 @@ final class LocalPairingRelay: @unchecked Sendable {
                 if let port = listener?.port?.rawValue {
                     startup.complete(.success(port))
                 } else {
-                    startup.complete(.failure(relayError("Relay listener has no port.")))
+                    startup.complete(.failure(Self.relayError("Relay listener has no port.")))
                 }
             case .failed(let error):
-                startup.complete(.failure(relayError("Relay listener failed: \(error.localizedDescription)")))
+                startup.complete(
+                    .failure(Self.relayError("Relay listener failed: \(error.localizedDescription)"))
+                )
             default:
                 break
             }
         }
-        listener.start(queue: DispatchQueue(label: "com.stik.stikdebug.local-pairing-relay.start"))
+        listener.start(
+            queue: DispatchQueue(label: "com.stik.stikdebug.local-pairing-relay.start")
+        )
 
         guard let result = startup.wait() else {
             listener.cancel()
@@ -306,15 +340,21 @@ final class LocalPairingRelay: @unchecked Sendable {
         self.log = log
     }
 
-    deinit { stop() }
+    deinit {
+        stop()
+    }
 
     func stop() {
         lock.lock()
-        guard !stopped else { lock.unlock(); return }
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
         stopped = true
         let active = Array(sessions.values)
         sessions.removeAll()
         lock.unlock()
+
         listener.cancel()
         active.forEach { $0.stop() }
     }
@@ -327,11 +367,17 @@ final class LocalPairingRelay: @unchecked Sendable {
             sources: sources,
             queue: queue,
             log: log,
-            finished: { [weak self] in self?.remove(id) }
+            finished: { [weak self] in
+                self?.remove(id)
+            }
         )
 
         lock.lock()
-        guard !stopped else { lock.unlock(); session.stop(); return }
+        guard !stopped else {
+            lock.unlock()
+            session.stop()
+            return
+        }
         sessions[id] = session
         lock.unlock()
         session.start()
@@ -387,10 +433,14 @@ final class LocalPairingRelay: @unchecked Sendable {
                 $0.pointee.sin_addr
             }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            guard inet_ntop(AF_INET, &address, &buffer, socklen_t(buffer.count)) != nil else { continue }
+            guard inet_ntop(AF_INET, &address, &buffer, socklen_t(buffer.count)) != nil else {
+                continue
+            }
 
             let source = Source(name: name, address: String(cString: buffer))
-            if !result.contains(source) { result.append(source) }
+            if !result.contains(source) {
+                result.append(source)
+            }
         }
         return result
     }
