@@ -14,12 +14,11 @@ struct StikDebugApp: App {
 
     init() {
         AppBootstrapper.configure()
-        // The on-device VPN uses the isolated synthetic peer address. Older
-        // builds stored the physical hotspot gateway, which always resets or
-        // times out; migrate those values automatically.
+        // LocalDevVPN's synthetic peer is .0. Older builds stored the tunnel
+        // interface (.1) or a physical hotspot gateway; migrate both.
         let key = UserDefaults.Keys.targetDeviceIP
         let stored = UserDefaults.standard.string(forKey: key) ?? ""
-        if stored.isEmpty || stored.hasPrefix("172.") || stored == "10.7.0.0" {
+        if stored.isEmpty || stored.hasPrefix("172.") || stored == "10.7.0.1" {
             UserDefaults.standard.set(DeviceConnectionContext.defaultTargetIPAddress, forKey: key)
         }
     }

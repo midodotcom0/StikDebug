@@ -8,7 +8,9 @@
 import Foundation
 
 enum DeviceConnectionContext {
-    static let defaultTargetIPAddress = "10.7.0.1"
+    // LocalDevVPN exposes the phone's remote-pairing service through the
+    // synthetic peer at .0; .1 is the Mac/tunnel interface and times out.
+    static let defaultTargetIPAddress = "10.7.0.0"
 
     static var targetIPAddress: String {
         let stored = UserDefaults.standard
