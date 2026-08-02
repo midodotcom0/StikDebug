@@ -9,6 +9,9 @@ import UIKit
 
 enum AppBootstrapper {
     static func configure() {
+        // Before anything can touch the FFI, so a failed connection always leaves
+        // a log behind.
+        IdeviceLogging.startIfNeeded()
         registerDefaultSettings()
         startConfiguredKeepAliveServices()
         applyDocumentPickerCopyWorkaround()
