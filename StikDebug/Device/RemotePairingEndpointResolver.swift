@@ -100,7 +100,11 @@ private final class RemotePairingResolution: @unchecked Sendable {
     }
 
     func start() {
-        let parameters = RemotePairingEndpointResolver.handoverParameters()
+        // Keep discovery on the plain Bonjour path. Multipath/handover is
+        // applied only to the connected anchor below; applying it to the
+        // browser can make the service disappear on iOS 27.
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = true
         let browser = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: parameters)
         self.browser = browser
 
