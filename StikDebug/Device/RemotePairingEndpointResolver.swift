@@ -211,12 +211,14 @@ enum DeviceSocketAddress {
         endpoint: RemotePairingEndpoint,
         _ body: (UnsafePointer<sockaddr>, socklen_t) -> Result
     ) throws -> Result {
+        let effectiveEndpoint = try LocalPairingRelayRegistry.redirectedEndpointIfNeeded(for: endpoint)
+
         var ipv4 = sockaddr_in()
-        let ipv4Result = endpoint.host.withCString { inet_pton(AF_INET, $0, &ipv4.sin_addr) }
+        let ipv4Result = effectiveEndpoint.host.withCString { inet_pton(AF_INET, $0, &ipv4.sin_addr) }
         if ipv4Result == 1 {
             ipv4.sin_len = UInt8(MemoryLayout<sockaddr_in>.stride)
             ipv4.sin_family = sa_family_t(AF_INET)
-            ipv4.sin_port = in_port_t(endpoint.port).bigEndian
+            ipv4.sin_port = in_port_t(effectiveEndpoint.port).bigEndian
             return withUnsafePointer(to: &ipv4) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     body($0, socklen_t(MemoryLayout<sockaddr_in>.stride))
@@ -225,7 +227,7 @@ enum DeviceSocketAddress {
         }
 
         var ipv6 = sockaddr_in6()
-        let ipv6Result = endpoint.host.withCString { inet_pton(AF_INET6, $0, &ipv6.sin6_addr) }
+        let ipv6Result = effectiveEndpoint.host.withCString { inet_pton(AF_INET6, $0, &ipv6.sin6_addr) }
         guard ipv6Result == 1 else {
             throw NSError(
                 domain: "StikDebug.RemotePairingDiscovery",
@@ -236,8 +238,8 @@ enum DeviceSocketAddress {
 
         ipv6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.stride)
         ipv6.sin6_family = sa_family_t(AF_INET6)
-        ipv6.sin6_port = in_port_t(endpoint.port).bigEndian
-        if let interfaceName = endpoint.interfaceName {
+        ipv6.sin6_port = in_port_t(effectiveEndpoint.port).bigEndian
+        if let interfaceName = effectiveEndpoint.interfaceName {
             let interfaceIndex = if_nametoindex(interfaceName)
             guard interfaceIndex != 0 else {
                 throw NSError(
