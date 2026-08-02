@@ -1,0 +1,34 @@
+name: Apply Local Pairing Relay
+
+on:
+  push:
+    branches: ["feature/local-pairing-relay"]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: feature/local-pairing-relay
+          fetch-depth: 0
+
+      - name: Apply relay integration
+        run: python3 scripts/apply_local_pairing_relay.py
+
+      - name: Commit integrated sources
+        run: |
+          if git diff --quiet; then
+            echo "Relay integration is already applied."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add StikDebug/Device/JITEnableContext.swift StikDebug/Device/IdeviceFFIBridge.swift
+          git commit -m "Integrate source-bound RemotePairing relay"
+          git push origin HEAD:feature/local-pairing-relay
