@@ -24,6 +24,7 @@
 //  network and can outlive the Wi-Fi association that was required to create it.
 //
 
+import Darwin
 import Foundation
 import idevice
 
@@ -90,6 +91,24 @@ final class DeviceTransport {
             } else {
                 UserDefaults.standard.removeObject(forKey: UserDefaults.Keys.transportOverride)
             }
+        }
+    }
+
+    /// Which local address the RemotePairing connection should originate from.
+    ///
+    /// `.system` is the historical behaviour: the kernel picks, which for a
+    /// device-local destination means source == destination. The other policies
+    /// route through `LocalPairingRelay` to force a different source.
+    static var configuredSourcePolicy: RelaySourcePolicy {
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: UserDefaults.Keys.pairingSourcePolicy),
+                  let policy = RelaySourcePolicy(rawValue: raw) else {
+                return .system
+            }
+            return policy
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: UserDefaults.Keys.pairingSourcePolicy)
         }
     }
 
@@ -349,8 +368,62 @@ final class DeviceTransport {
     }
 
     /// The classic path: speak RemotePairing directly to `remotepairingdeviced`.
+    ///
+    /// When a source policy other than `.system` is configured, the connection is
+    /// routed through `LocalPairingRelay` so the outbound socket can be bound to a
+    /// different local address. `tunnel_create_rppairing` creates its own socket
+    /// internally and offers no way to bind it, so the loopback hop is the only
+    /// place we can influence the source address without rebuilding the Rust library.
     private func createRemotePairingTunnel(hostname: String) throws -> TunnelHandles {
+        let policy = Self.configuredSourcePolicy
+        guard policy == .system else {
+            return try createRelayedRemotePairingTunnel(hostname: hostname, policy: policy)
+        }
+        return try createDirectRemotePairingTunnel(hostname: hostname)
+    }
+
+    private func createRelayedRemotePairingTunnel(
+        hostname: String,
+        policy: RelaySourcePolicy
+    ) throws -> TunnelHandles {
+        let relay = LocalPairingRelay(
+            destinationHost: DeviceConnectionContext.targetIPAddress,
+            destinationPort: DeviceTransportKind.remotePairing.port,
+            policy: policy
+        )
+        let relayPort = try relay.start()
+        defer { relay.stop() }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = relayPort.bigEndian
+        address.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+
+        do {
+            return try createRemotePairingTunnel(hostname: hostname, address: &address)
+        } catch {
+            if let source = relay.observedSourceAddress {
+                LogManager.shared.addWarningLog(
+                    "Relayed RemotePairing failed with source \(source). "
+                    + (source == DeviceConnectionContext.targetIPAddress
+                       ? "Source still equals the destination."
+                       : "Source differed from the destination, so the source address is not the blocker.")
+                )
+            }
+            throw error
+        }
+    }
+
+    private func createDirectRemotePairingTunnel(hostname: String) throws -> TunnelHandles {
         var address = try socketAddress(port: DeviceTransportKind.remotePairing.port)
+        return try createRemotePairingTunnel(hostname: hostname, address: &address)
+    }
+
+    private func createRemotePairingTunnel(
+        hostname: String,
+        address: inout sockaddr_in
+    ) throws -> TunnelHandles {
 
         var pairingFile: OpaquePointer?
         let pairingPath = PairingFileStore.prepareURL().path

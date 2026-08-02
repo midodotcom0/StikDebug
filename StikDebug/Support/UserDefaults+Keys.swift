@@ -22,5 +22,8 @@ extension UserDefaults {
         /// Connects the tunnel on launch. Off means the connection is built the first
         /// time a feature actually needs it.
         static let autoConnectOnLaunch = "autoConnectOnLaunch"
+        /// Which local address the RemotePairing connection originates from.
+        /// Anything but the system default routes through the loopback relay.
+        static let pairingSourcePolicy = "PairingSourcePolicy"
     }
 }

@@ -21,6 +21,16 @@ struct SettingsView: View {
     @AppStorage(UserDefaults.Keys.targetDeviceIP) private var targetDeviceIP = DeviceConnectionContext.defaultTargetIPAddress
     @AppStorage(UserDefaults.Keys.autoConnectOnLaunch) private var autoConnectOnLaunch = true
     @AppStorage(UserDefaults.Keys.transportOverride) private var transportOverrideSelection = "auto"
+    @AppStorage(UserDefaults.Keys.pairingSourcePolicy) private var pairingSourceSelection = RelaySourcePolicy.system.rawValue
+
+    /// Explains what forcing a source address does, and why it might matter.
+    private var sourceFooter: String {
+        let policy = RelaySourcePolicy(rawValue: pairingSourceSelection) ?? .system
+        if policy == .system {
+            return "Connection source: \(policy.detail) On cellular the only reachable listener is the device's own hotspot address, which makes this a self-connection — the developer service does not answer those. Pick another source to route through a loopback relay and test whether that is the cause."
+        }
+        return "Connection source: \(policy.detail) The connection is relayed through loopback so the outgoing socket can be bound explicitly. The address actually used is written to the log."
+    }
 
     /// Explains what pinning a transport means, so the picker is not a mystery knob.
     private var transportFooter: String {
@@ -161,10 +171,16 @@ struct SettingsView: View {
                             Text(kind.title).tag(kind.rawValue)
                         }
                     }
+
+                    Picker("Connection Source", selection: $pairingSourceSelection) {
+                        ForEach(RelaySourcePolicy.allCases) { policy in
+                            Text(policy.title).tag(policy.rawValue)
+                        }
+                    }
                 } header: {
                     Text("Connection")
                 } footer: {
-                    Text(transportFooter)
+                    Text("\(transportFooter)\n\n\(sourceFooter)")
                 }
 
                 Section("Advanced") {
