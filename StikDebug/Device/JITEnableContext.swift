@@ -211,9 +211,7 @@ final class JITEnableContext {
         } catch let relayError as NSError {
             failures.append("Local hotspot relay failed: \(relayError.localizedDescription)")
             throw makeError(
-                failures.joined(separator: "
-
-"),
+                failures.joined(separator: "\n\n"),
                 code: relayError.code
             )
         }
@@ -240,7 +238,9 @@ final class JITEnableContext {
             )
             return tunnel
         }
-    }    private func createTunnel(
+    }
+
+    private func createTunnel(
         hostname: String,
         pairingFile: OpaquePointer,
         endpoint: RemotePairingEndpoint
