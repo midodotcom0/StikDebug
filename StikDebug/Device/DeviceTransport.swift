@@ -359,6 +359,21 @@ final class DeviceTransport {
     // MARK: - Backends
 
     private func createTunnel(kind: DeviceTransportKind, hostname: String) throws -> TunnelHandles {
+        // Check reachability first. The FFI has no connect timeout of its own, so
+        // aiming it at an address that does not exist — a hotspot that is off, a
+        // stale target IP — blocks for minutes instead of failing over to the other
+        // transport. A 4-second probe turns that into an immediate, explainable skip.
+        let target = DeviceConnectionContext.targetIPAddress
+        let outcome = TransportProbe.probe(host: target, port: kind.port, timeout: 4)
+        guard outcome == .connected else {
+            LogManager.shared.addWarningLog(
+                "Skipping \(kind.title): \(target):\(kind.port) is \(outcome.summary)"
+            )
+            throw TransportError.unreachable(kind: kind, host: target, outcome: outcome)
+        }
+
+        LogManager.shared.addInfoLog("Trying \(kind.title) at \(target):\(kind.port)")
+
         switch kind {
         case .remotePairing:
             return try createRemotePairingTunnel(hostname: hostname)
@@ -561,6 +576,31 @@ enum TransportError {
         code: -999,
         userInfo: [NSLocalizedDescriptionKey: "Connection cancelled."]
     )
+
+    /// The target port did not accept a TCP connection, so there is no point
+    /// handing the address to the FFI and waiting out its lack of a timeout.
+    static func unreachable(
+        kind: DeviceTransportKind,
+        host: String,
+        outcome: ProbeOutcome
+    ) -> NSError {
+        let explanation: String
+        switch outcome {
+        case .refused:
+            explanation = "\(host) answered but nothing is listening on port \(kind.port)."
+        case .timedOut:
+            explanation = "No reply from \(host):\(kind.port) — the address does not exist on any active interface."
+        case .invalidAddress:
+            explanation = "\(host) is not a valid IPv4 address."
+        default:
+            explanation = "\(host):\(kind.port) is not reachable (\(outcome.summary))."
+        }
+        return NSError(
+            domain: domain,
+            code: outcome == .refused ? 61 : 60,
+            userInfo: [NSLocalizedDescriptionKey: explanation]
+        )
+    }
 
     static func invalidTargetAddress(_ address: String) -> NSError {
         NSError(
