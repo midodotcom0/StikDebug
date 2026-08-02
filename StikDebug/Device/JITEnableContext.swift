@@ -21,6 +21,7 @@ final class JITEnableContext {
         var adapter: OpaquePointer?
         var handshake: OpaquePointer?
         var endpointLease: RemotePairingEndpointLease?
+        var relayLease: LocalPairingRelayLease?
 
         mutating func free() {
             if let handshake {
@@ -32,12 +33,14 @@ final class JITEnableContext {
                 self.adapter = nil
             }
             endpointLease = nil
+            relayLease = nil
         }
     }
 
     private var adapter: OpaquePointer?
     private var handshake: OpaquePointer?
     private var endpointLease: RemotePairingEndpointLease?
+    private var relayLease: LocalPairingRelayLease?
 
     private let tunnelLock = NSLock()
     private var tunnelConnecting = false
@@ -73,6 +76,7 @@ final class JITEnableContext {
             adapter_free(adapter)
         }
         endpointLease = nil
+        relayLease = nil
     }
 
     private func makeError(_ message: String, code: Int = -1) -> NSError {
@@ -144,8 +148,12 @@ final class JITEnableContext {
         let pairingFile = try getPairingFile()
         defer { rp_pairing_file_free(pairingFile) }
 
-        var peerToPeerError: NSError?
-        if let discovered = try? RemotePairingEndpointResolver.resolve() {
+        var failures: [String] = []
+        let discovered = try? RemotePairingEndpointResolver.resolve()
+
+        if let discovered,
+           discovered.endpoint.interfaceName != "bridge100",
+           discovered.endpoint.host != LocalPairingRelayFactory.hotspotEndpoint.host {
             do {
                 return try withExtendedLifetime(discovered) {
                     var tunnel = try createTunnel(
@@ -156,9 +164,27 @@ final class JITEnableContext {
                     tunnel.endpointLease = discovered
                     return tunnel
                 }
-            } catch let error as NSError {
-                peerToPeerError = error
-                routeLog("Direct peer-to-peer tunnel failed; trying configured VPN target: \(error.localizedDescription)")
+            } catch let directError as NSError {
+                failures.append("Direct peer-to-peer failed: \(directError.localizedDescription)")
+                routeLog("Direct peer-to-peer tunnel failed: \(directError.localizedDescription)")
+            }
+        }
+
+        if let discovered,
+           discovered.endpoint.interfaceName == "bridge100"
+            || discovered.endpoint.host == LocalPairingRelayFactory.hotspotEndpoint.host {
+            do {
+                routeLog(
+                    "Remote Pairing is advertised on bridge100; trying source-bound local relay to \(discovered.endpoint.displayName)"
+                )
+                return try createRelayedTunnel(
+                    hostname: hostname,
+                    pairingFile: pairingFile,
+                    target: discovered.endpoint
+                )
+            } catch let relayError as NSError {
+                failures.append("Local hotspot relay failed: \(relayError.localizedDescription)")
+                routeLog("Local hotspot relay failed: \(relayError.localizedDescription)")
             }
         }
 
@@ -172,11 +198,45 @@ final class JITEnableContext {
                 )
             )
         } catch let vpnError as NSError {
-            guard let peerToPeerError else { throw vpnError }
-            throw makeError(
-                "Direct peer-to-peer failed: \(peerToPeerError.localizedDescription)\n\nConfigured VPN target failed: \(vpnError.localizedDescription)",
-                code: vpnError.code
+            failures.append("Configured VPN target failed: \(vpnError.localizedDescription)")
+            routeLog("Configured VPN target failed: \(vpnError.localizedDescription)")
+        }
+
+        do {
+            return try createRelayedTunnel(
+                hostname: hostname,
+                pairingFile: pairingFile,
+                target: LocalPairingRelayFactory.hotspotEndpoint
             )
+        } catch let relayError as NSError {
+            failures.append("Local hotspot relay failed: \(relayError.localizedDescription)")
+            throw makeError(
+                failures.joined(separator: "\n\n"),
+                code: relayError.code
+            )
+        }
+    }
+
+    private func createRelayedTunnel(
+        hostname: String,
+        pairingFile: OpaquePointer,
+        target: RemotePairingEndpoint
+    ) throws -> TunnelHandles {
+        let relay = try LocalPairingRelayFactory.start(target: target)
+
+        return try withExtendedLifetime(relay) {
+            var tunnel = try createTunnel(
+                hostname: hostname,
+                pairingFile: pairingFile,
+                endpoint: relay.endpoint
+            )
+            tunnel.relayLease = relay
+            routeLog(
+                "Local hotspot relay connected via \(relay.endpoint.displayName); "
+                    + "source \(LocalPairingRelayFactory.localDevVPNSourceAddress), "
+                    + "target \(target.displayName)"
+            )
+            return tunnel
         }
     }
 
@@ -239,6 +299,7 @@ final class JITEnableContext {
         var newAdapter: OpaquePointer?
         var newHandshake: OpaquePointer?
         var newEndpointLease: RemotePairingEndpointLease?
+        var newRelayLease: LocalPairingRelayLease?
         var finalError: NSError?
 
         defer {
@@ -255,6 +316,7 @@ final class JITEnableContext {
             newAdapter = newTunnel.adapter
             newHandshake = newTunnel.handshake
             newEndpointLease = newTunnel.endpointLease
+            newRelayLease = newTunnel.relayLease
         } catch let tunnelError as NSError {
             finalError = tunnelError
             throw tunnelError
@@ -267,10 +329,12 @@ final class JITEnableContext {
             adapter_free(adapter)
         }
         endpointLease = nil
+        relayLease = nil
 
         adapter = newAdapter
         handshake = newHandshake
         endpointLease = newEndpointLease
+        relayLease = newRelayLease
     }
 
     func ensureTunnel() throws {

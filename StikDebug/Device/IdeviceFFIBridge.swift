@@ -730,6 +730,7 @@ private enum LocationSimulationState {
     static var remoteServer: OpaquePointer?
     static var locationSimulation: OpaquePointer?
     static var endpointLease: RemotePairingEndpointLease?
+    static var relayLease: LocalPairingRelayLease?
 
     static func cleanup() {
         if let locationSimulation {
@@ -749,6 +750,7 @@ private enum LocationSimulationState {
             self.adapter = nil
         }
         endpointLease = nil
+        relayLease = nil
     }
 }
 
@@ -779,10 +781,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
 
     defer { rp_pairing_file_free(pairingHandle) }
 
-    var discoveryLease = try? RemotePairingEndpointResolver.resolve()
-    var endpoint = discoveryLease?.endpoint ?? RemotePairingEndpoint(host: deviceIP, port: 49152)
-
-    func createProvider() throws -> UnsafeMutablePointer<IdeviceFfiError>? {
+    func createProvider(endpoint: RemotePairingEndpoint) throws -> UnsafeMutablePointer<IdeviceFfiError>? {
         try DeviceSocketAddress.withSockAddr(endpoint: endpoint) { address, addressLength in
             tunnel_create_rppairing(
                 address,
@@ -797,38 +796,89 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         }
     }
 
-    var providerError: UnsafeMutablePointer<IdeviceFfiError>?
-    do {
-        providerError = try withExtendedLifetime(discoveryLease) { try createProvider() }
-
-        if providerError != nil, discoveryLease != nil {
-            idevice_error_free(providerError)
-            LocationSimulationState.cleanup()
-            discoveryLease = nil
-            endpoint = RemotePairingEndpoint(host: deviceIP, port: 49152)
-            providerError = try createProvider()
+    func createRelayedProvider(target: RemotePairingEndpoint) throws -> UnsafeMutablePointer<IdeviceFfiError>? {
+        let relay = try LocalPairingRelayFactory.start(target: target)
+        let providerError = try withExtendedLifetime(relay) {
+            try createProvider(endpoint: relay.endpoint)
         }
-    } catch {
-        if discoveryLease != nil {
-            LocationSimulationState.cleanup()
-            discoveryLease = nil
-            endpoint = RemotePairingEndpoint(host: deviceIP, port: 49152)
-            do {
-                providerError = try createProvider()
-            } catch {
-                return LocationSimulationStatus.invalidIP
+        if providerError == nil {
+            LocationSimulationState.relayLease = relay
+        }
+        return providerError
+    }
+
+    var providerCreated = false
+    let discovered = try? RemotePairingEndpointResolver.resolve()
+
+    if let discovered,
+       discovered.endpoint.interfaceName != "bridge100",
+       discovered.endpoint.host != LocalPairingRelayFactory.hotspotEndpoint.host {
+        do {
+            let providerError = try withExtendedLifetime(discovered) {
+                try createProvider(endpoint: discovered.endpoint)
             }
-        } else {
-            return LocationSimulationStatus.invalidIP
+            if let providerError {
+                idevice_error_free(providerError)
+                LocationSimulationState.cleanup()
+            } else {
+                LocationSimulationState.endpointLease = discovered
+                providerCreated = true
+            }
+        } catch {
+            LocationSimulationState.cleanup()
         }
     }
 
-    if let providerError {
-        idevice_error_free(providerError)
+    if !providerCreated,
+       let discovered,
+       discovered.endpoint.interfaceName == "bridge100"
+        || discovered.endpoint.host == LocalPairingRelayFactory.hotspotEndpoint.host {
+        do {
+            if let providerError = try createRelayedProvider(target: discovered.endpoint) {
+                idevice_error_free(providerError)
+                LocationSimulationState.cleanup()
+            } else {
+                providerCreated = true
+            }
+        } catch {
+            LocationSimulationState.cleanup()
+        }
+    }
+
+    if !providerCreated {
+        do {
+            let configuredEndpoint = RemotePairingEndpoint(host: deviceIP, port: 49152)
+            if let providerError = try createProvider(endpoint: configuredEndpoint) {
+                idevice_error_free(providerError)
+                LocationSimulationState.cleanup()
+            } else {
+                providerCreated = true
+            }
+        } catch {
+            LocationSimulationState.cleanup()
+        }
+    }
+
+    if !providerCreated {
+        do {
+            if let providerError = try createRelayedProvider(
+                target: LocalPairingRelayFactory.hotspotEndpoint
+            ) {
+                idevice_error_free(providerError)
+                LocationSimulationState.cleanup()
+                return LocationSimulationStatus.providerCreate
+            }
+            providerCreated = true
+        } catch {
+            LocationSimulationState.cleanup()
+            return LocationSimulationStatus.providerCreate
+        }
+    }
+
+    guard providerCreated else {
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.providerCreate
     }
-    LocationSimulationState.endpointLease = discoveryLease
 
     let remoteServerError = remote_server_connect_rsd(
         LocationSimulationState.adapter,
