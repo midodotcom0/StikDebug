@@ -37,22 +37,18 @@ struct RemotePairingEndpoint: Equatable, Sendable {
 
 final class RemotePairingEndpointLease {
     let endpoint: RemotePairingEndpoint
-    private let browser: NWBrowser
-    private let anchorConnection: NWConnection
+    private let cancellation: () -> Void
 
     fileprivate init(
         endpoint: RemotePairingEndpoint,
-        browser: NWBrowser,
-        anchorConnection: NWConnection
+        cancellation: @escaping () -> Void
     ) {
         self.endpoint = endpoint
-        self.browser = browser
-        self.anchorConnection = anchorConnection
+        self.cancellation = cancellation
     }
 
     deinit {
-        browser.cancel()
-        anchorConnection.cancel()
+        cancellation()
     }
 }
 
@@ -60,9 +56,38 @@ enum RemotePairingEndpointResolver {
     private static let serviceType = "_remotepairing._tcp"
 
     static func resolve(timeout: TimeInterval = 6) throws -> RemotePairingEndpointLease {
-        let resolution = RemotePairingResolution(serviceType: serviceType)
-        resolution.start()
-        return try resolution.wait(timeout: timeout)
+        do {
+            let resolution = RemotePairingResolution(serviceType: serviceType)
+            resolution.start()
+            return try resolution.wait(timeout: timeout)
+        } catch let discoveryError as NSError {
+            let configuredTarget = RemotePairingEndpoint(
+                host: DeviceConnectionContext.targetIPAddress,
+                port: 49152
+            )
+
+            guard LocalPairingRelay.shouldAttempt(target: configuredTarget) else {
+                throw discoveryError
+            }
+
+            do {
+                let relay = try LocalPairingRelay.start(target: configuredTarget) { message in
+                    LogManager.shared.addInfoLog(message)
+                }
+                LogManager.shared.addInfoLog(
+                    "Using local RemotePairing relay at \(relay.endpoint.displayName) for \(configuredTarget.displayName)"
+                )
+                return RemotePairingEndpointLease(
+                    endpoint: relay.endpoint,
+                    cancellation: { relay.stop() }
+                )
+            } catch let relayError as NSError {
+                LogManager.shared.addWarningLog(
+                    "Local RemotePairing relay could not start: \(relayError.localizedDescription)"
+                )
+                throw discoveryError
+            }
+        }
     }
 }
 
@@ -168,8 +193,10 @@ private final class RemotePairingResolution: @unchecked Sendable {
             }
             return RemotePairingEndpointLease(
                 endpoint: endpoint,
-                browser: browser,
-                anchorConnection: anchor
+                cancellation: {
+                    browser.cancel()
+                    anchor.cancel()
+                }
             )
         case .failure(let error):
             resources.browser?.cancel()
