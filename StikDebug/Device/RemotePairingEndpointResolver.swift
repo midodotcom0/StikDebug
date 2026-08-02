@@ -37,14 +37,14 @@ struct RemotePairingEndpoint: Equatable, Sendable {
 
 final class RemotePairingEndpointLease {
     let endpoint: RemotePairingEndpoint
-    private let browser: NWBrowser
+    private let browser: NWBrowser?
     private let anchorConnection: NWConnection
     private let pathMonitor: NWPathMonitor
     private let pathQueue = DispatchQueue(label: "com.stik.stikdebug.remote-pairing-path")
 
     fileprivate init(
         endpoint: RemotePairingEndpoint,
-        browser: NWBrowser,
+        browser: NWBrowser?,
         anchorConnection: NWConnection,
         pathMonitor: NWPathMonitor
     ) {
@@ -56,7 +56,7 @@ final class RemotePairingEndpointLease {
     }
 
     deinit {
-        browser.cancel()
+        browser?.cancel()
         anchorConnection.cancel()
         pathMonitor.cancel()
     }
@@ -158,10 +158,17 @@ private final class RemotePairingResolution: @unchecked Sendable {
     }
 
     func wait(timeout: TimeInterval) throws -> RemotePairingEndpointLease {
-        let waitResult = semaphore.wait(timeout: .now() + max(timeout, 0))
+        var waitResult = semaphore.wait(timeout: .now() + max(timeout, 0))
         guard waitResult == .success else {
-            queue.sync { cancelAllOnQueue() }
-            throw makeError("No Remote Pairing service was found within \(Int(timeout)) seconds.")
+            // Bonjour is commonly absent behind LocalDevVPN. Keep a real
+            // NWConnection anchor on the configured synthetic peer and let
+            // the FFI socket reuse that route for pair-verify.
+            startConfiguredFallback()
+            waitResult = semaphore.wait(timeout: .now() + 5)
+            guard waitResult == .success else {
+                queue.sync { cancelAllOnQueue() }
+                throw makeError("No Remote Pairing service was found within \(Int(timeout)) seconds.")
+            }
         }
 
         lock.lock()
@@ -216,6 +223,34 @@ private final class RemotePairingResolution: @unchecked Sendable {
         browser = nil
         connection?.cancel()
         connection = nil
+    }
+
+    private func startConfiguredFallback() {
+        queue.sync {
+            browser?.cancel()
+            browser = nil
+            guard connection == nil else { return }
+            let host = DeviceConnectionContext.targetIPAddress
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: 49152)!
+            )
+            let parameters = RemotePairingEndpointResolver.handoverParameters()
+            let connection = NWConnection(to: endpoint, using: parameters)
+            self.connection = connection
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                guard let self, let connection else { return }
+                switch state {
+                case .ready:
+                    self.complete(.success(RemotePairingEndpoint(host: host, port: 49152)))
+                case .failed(let error):
+                    self.complete(.failure(self.makeError("Configured Remote Pairing endpoint failed: \(error.localizedDescription)")))
+                default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+        }
     }
 
     private func makeError(_ message: String) -> NSError {
