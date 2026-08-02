@@ -74,7 +74,10 @@ final class RemotePairingDiscoveryProbe: ObservableObject {
 
             switch self.status {
             case .browsing:
-                self.finish(with: .notFound)
+                // LocalDevVPN carries TCP but does not proxy Bonjour. Fall
+                // back to the configured synthetic peer instead of reporting
+                // a false "no service" result after the browse window.
+                self.connectToConfiguredTarget()
             case .connecting(let service):
                 self.finish(with: .failed(reason: "Found \(service), but its endpoint timed out."))
             default:
@@ -83,6 +86,22 @@ final class RemotePairingDiscoveryProbe: ObservableObject {
         }
 
         browser.start(queue: networkQueue)
+    }
+
+    private func connectToConfiguredTarget() {
+        let host = DeviceConnectionContext.targetIPAddress
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: 49152)!
+        )
+        connect(to: endpoint)
+        timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if case .connecting(let service) = self.status {
+                self.finish(with: .failed(reason: "Configured VPN target (service) did not respond."))
+            }
+        }
     }
 
     private func connect(to endpoint: NWEndpoint) {
