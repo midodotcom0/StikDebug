@@ -159,13 +159,13 @@ private final class RemotePairingResolution: @unchecked Sendable {
 
     func wait(timeout: TimeInterval) throws -> RemotePairingEndpointLease {
         var waitResult = semaphore.wait(timeout: .now() + max(timeout, 0))
-        guard waitResult == .success else {
+        if waitResult != .success {
             // Bonjour is commonly absent behind LocalDevVPN. Keep a real
             // NWConnection anchor on the configured synthetic peer and let
             // the FFI socket reuse that route for pair-verify.
             startConfiguredFallback()
             waitResult = semaphore.wait(timeout: .now() + 5)
-            guard waitResult == .success else {
+            if waitResult != .success {
                 queue.sync { cancelAllOnQueue() }
                 throw makeError("No Remote Pairing service was found within \(Int(timeout)) seconds.")
             }
