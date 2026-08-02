@@ -417,16 +417,28 @@ final class DeviceTransport {
 
         do {
             return try createRemotePairingTunnel(hostname: hostname, address: &address)
-        } catch {
-            if let source = relay.observedSourceAddress {
-                LogManager.shared.addWarningLog(
-                    "Relayed RemotePairing failed with source \(source). "
-                    + (source == DeviceConnectionContext.targetIPAddress
-                       ? "Source still equals the destination."
-                       : "Source differed from the destination, so the source address is not the blocker.")
-                )
+        } catch let error as NSError {
+            // Put the finding in the error itself, not just the log. This is the
+            // one fact the whole relay exists to establish, and it is useless if it
+            // is buried in a console the user has to go looking for.
+            guard let source = relay.observedSourceAddress else {
+                throw error
             }
-            throw error
+
+            let target = DeviceConnectionContext.targetIPAddress
+            let verdict = source == target
+                ? "The source address was still \(source), identical to the target — this remained a self-connection."
+                : "The source address was \(source), different from the target \(target). The connection was therefore not a self-connection, so the source address is not what blocks the handshake."
+
+            LogManager.shared.addWarningLog("Relayed RemotePairing failed. \(verdict)")
+
+            throw NSError(
+                domain: TransportError.domain,
+                code: error.code,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "\(error.localizedDescription)\n\n\(verdict)"
+                ]
+            )
         }
     }
 
