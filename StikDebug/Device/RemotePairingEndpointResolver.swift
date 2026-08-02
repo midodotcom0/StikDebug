@@ -39,25 +39,45 @@ final class RemotePairingEndpointLease {
     let endpoint: RemotePairingEndpoint
     private let browser: NWBrowser
     private let anchorConnection: NWConnection
+    private let pathMonitor: NWPathMonitor
+    private let pathQueue = DispatchQueue(label: "com.stik.stikdebug.remote-pairing-path")
 
     fileprivate init(
         endpoint: RemotePairingEndpoint,
         browser: NWBrowser,
-        anchorConnection: NWConnection
+        anchorConnection: NWConnection,
+        pathMonitor: NWPathMonitor
     ) {
         self.endpoint = endpoint
         self.browser = browser
         self.anchorConnection = anchorConnection
+        self.pathMonitor = pathMonitor
+        pathMonitor.start(queue: pathQueue)
     }
 
     deinit {
         browser.cancel()
         anchorConnection.cancel()
+        pathMonitor.cancel()
     }
 }
 
 enum RemotePairingEndpointResolver {
     private static let serviceType = "_remotepairing._tcp"
+
+    /// Parameters used only for discovery/route anchoring.  The native FFI
+    /// opens the actual tunnel socket, but keeping an NWConnection with
+    /// handover enabled lets iOS migrate the route when Wi-Fi disappears.
+    fileprivate static func handoverParameters() -> NWParameters {
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = true
+        parameters.prohibitExpensivePath = false
+        parameters.prohibitConstrainedPath = false
+        if #available(iOS 11.0, *) {
+            parameters.multipathServiceType = .handover
+        }
+        return parameters
+    }
 
     static func resolve(timeout: TimeInterval = 6) throws -> RemotePairingEndpointLease {
         let resolution = RemotePairingResolution(serviceType: serviceType)
@@ -82,8 +102,7 @@ private final class RemotePairingResolution: @unchecked Sendable {
     }
 
     func start() {
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
+        let parameters = handoverParameters()
         let browser = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: parameters)
         self.browser = browser
 
@@ -105,8 +124,7 @@ private final class RemotePairingResolution: @unchecked Sendable {
                 advertisedInterface = nil
             }
 
-            let parameters = NWParameters.tcp
-            parameters.includePeerToPeer = true
+            let parameters = RemotePairingEndpointResolver.handoverParameters()
             let connection = NWConnection(to: serviceEndpoint, using: parameters)
             self.connection = connection
 
@@ -169,7 +187,8 @@ private final class RemotePairingResolution: @unchecked Sendable {
             return RemotePairingEndpointLease(
                 endpoint: endpoint,
                 browser: browser,
-                anchorConnection: anchor
+                anchorConnection: anchor,
+                pathMonitor: NWPathMonitor()
             )
         case .failure(let error):
             resources.browser?.cancel()
