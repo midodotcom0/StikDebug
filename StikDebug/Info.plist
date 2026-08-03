@@ -18,6 +18,7 @@
 	</array>
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_remotepairing._tcp</string>
 		<string>_stikdebug._tcp</string>
 		<string>_stikdebug._udp</string>
 	</array>
