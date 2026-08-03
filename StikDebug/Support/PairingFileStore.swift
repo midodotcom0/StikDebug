@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 
 enum PairingFileStore {
     static let fileName = "pairingFile.plist"
+    static let lockdownFileName = "lockdownPairRecord.plist"
     static let supportedContentTypes: [UTType] = [
         UTType(filenameExtension: "mobiledevicepairing", conformingTo: .data)!,
         UTType(filenameExtension: "mobiledevicepair", conformingTo: .data)!,
@@ -18,6 +19,16 @@ enum PairingFileStore {
 
     static var url: URL {
         directoryURL.appendingPathComponent(fileName)
+    }
+
+    /// The separate location for a lockdown pair record.
+    ///
+    /// The RemotePairing file the app imports for Wi-Fi use is a different
+    /// format from the lockdown pair record that CoreDeviceProxy needs. They
+    /// live side by side: the RemotePairing file under `url`, the lockdown
+    /// record under `lockdownPairingURL()`.
+    static func lockdownPairingURL() -> URL {
+        directoryURL.appendingPathComponent(lockdownFileName)
     }
 
     @discardableResult
@@ -73,6 +84,23 @@ enum PairingFileStore {
             try fileManager.removeItem(at: destination)
         }
         removeLegacyCopies(fileManager: fileManager)
+    }
+
+    /// True when a lockdown pair record has been imported for CoreDeviceProxy.
+    static func hasLockdownPairRecord(fileManager: FileManager = .default) -> Bool {
+        return fileManager.fileExists(atPath: lockdownPairingURL().path)
+    }
+
+    /// Imports a lockdown pair record for CoreDeviceProxy use on cellular.
+    ///
+    /// This is a separate file from the RemotePairing record used for Wi-Fi.
+    /// The lockdown record is created by pairing the device with a computer
+    /// over USB (`idevicepair pair`) and exporting the resulting file.
+    static func importLockdownPairRecord(_ sourceURL: URL, fileManager: FileManager = .default) throws {
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let destination = lockdownPairingURL()
+        try replaceItem(at: destination, with: sourceURL, fileManager: fileManager)
+        protectPairingFile(at: destination, fileManager: fileManager)
     }
 
     private static var directoryURL: URL {

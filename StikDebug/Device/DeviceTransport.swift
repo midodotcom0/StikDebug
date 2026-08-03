@@ -334,19 +334,30 @@ final class DeviceTransport {
             return [override]
         }
 
-        var kinds: [DeviceTransportKind] = [.remotePairing, .coreDeviceProxy]
+        // CoreDeviceProxy needs a lockdown pair record — a different format from
+        // the RemotePairing file the app imports for Wi-Fi use. Skip it
+        // entirely when no lockdown record is present: it cannot succeed and
+        // would only burn a probe timeout before falling through.
+        let hasLockdownRecord = FileManager.default.fileExists(
+            atPath: PairingFileStore.lockdownPairingURL().path
+        )
+
+        var kinds: [DeviceTransportKind] = hasLockdownRecord
+            ? [.remotePairing, .coreDeviceProxy]
+            : [.remotePairing]
 
         // Without a Wi-Fi client association, `remotepairingdeviced` is guaranteed
         // not to be listening. Skip straight past it instead of burning a timeout.
         let interfaces = TransportProbe.activeInterfaceNames()
         let hasWiFiClient = interfaces.contains { $0 == "en0" || $0 == "en1" }
         if !hasWiFiClient {
-            kinds = [.coreDeviceProxy, .remotePairing]
+            kinds = hasLockdownRecord
+                ? [.coreDeviceProxy, .remotePairing]
+                : [.remotePairing]
         }
 
         // Otherwise start with whatever worked last time.
-        if hasWiFiClient,
-           let raw = UserDefaults.standard.string(forKey: UserDefaults.Keys.lastSuccessfulTransport),
+        if let raw = UserDefaults.standard.string(forKey: UserDefaults.Keys.lastSuccessfulTransport),
            let last = DeviceTransportKind(rawValue: raw),
            let index = kinds.firstIndex(of: last) {
             kinds.remove(at: index)
@@ -495,12 +506,21 @@ final class DeviceTransport {
     /// CoreDeviceProxy carry the tunnel. `tunnel_create_usb` is named for its
     /// usual transport, but it takes an arbitrary provider — feeding it a TCP
     /// provider reaches the same RSD without `remotepairingdeviced`.
+    ///
+    /// This transport requires a lockdown pair record (created via USB pairing),
+    /// not the RemotePairing file the app normally imports. When the on-disk
+    /// pairing file is in RemotePairing format, this path is skipped — the
+    /// pairing file format and the lockdown handshake are incompatible.
     private func createCoreDeviceProxyTunnel(hostname: String) throws -> TunnelHandles {
         var address = try socketAddress(port: DeviceTransportKind.coreDeviceProxy.port)
 
+        let lockdownPairingURL = PairingFileStore.lockdownPairingURL()
+        guard FileManager.default.fileExists(atPath: lockdownPairingURL.path) else {
+            throw TransportError.lockdownPairingFileMissing
+        }
+
         var pairingFile: OpaquePointer?
-        let pairingPath = PairingFileStore.prepareURL().path
-        if let ffiError = pairingPath.withCString({ idevice_pairing_file_read($0, &pairingFile) }) {
+        if let ffiError = lockdownPairingURL.path.withCString({ idevice_pairing_file_read($0, &pairingFile) }) {
             throw TransportError.ffi(
                 ffiError,
                 fallback: "Pairing file is not a lockdown pair record"
@@ -563,6 +583,24 @@ enum TransportError {
         domain: domain,
         code: -17,
         userInfo: [NSLocalizedDescriptionKey: "Pairing file not found."]
+    )
+
+    static let lockdownPairingFileMissing = NSError(
+        domain: domain,
+        code: -20,
+        userInfo: [NSLocalizedDescriptionKey:
+            """
+            No lockdown pair record available.
+
+            CoreDeviceProxy needs a lockdown pair record (created by pairing this device
+            with a computer over USB), but none has been imported. The RemotePairing file
+            imported for Wi-Fi use is a different format and cannot be used here.
+
+            To enable cellular, connect the device to a computer, run `idevicepair pair`,
+            export the resulting pair record, and import it under Settings → Pairing File
+            → Import Lockdown Pair Record.
+            """
+        ]
     )
 
     static let pairingFileUnreadable = NSError(
