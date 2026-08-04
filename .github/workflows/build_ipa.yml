@@ -20,15 +20,12 @@ jobs:
           ref: b79d4bf65ed6fd2ac3fe1af26e3f296018e05260
           path: LocalDevVPN-source
 
-      - name: Install ldid
-        run: brew install ldid
-
       - name: Configure Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '26.6'
 
-      - name: Build archive
+      - name: Build unsigned archive
         working-directory: LocalDevVPN-source
         run: |
           xcodebuild clean archive \
@@ -40,21 +37,23 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package and fake-sign IPA
+      - name: Package unsigned IPA for iLoader signing
         working-directory: LocalDevVPN-source
         run: |
           mkdir -p Payload
           cp -R build/LocalDevVPN.xcarchive/Products/Applications/LocalDevVPN.app Payload/LocalDevVPN.app
-          APPEX_PATH=$(find Payload/LocalDevVPN.app/PlugIns -name "*.appex" | head -n 1)
-          test -n "$APPEX_PATH"
-          ldid -S"${GITHUB_WORKSPACE}/LocalDevVPN-source/TunnelProv/TunnelProv.entitlements" "$APPEX_PATH/$(basename "$APPEX_PATH" .appex)"
-          ldid -S"${GITHUB_WORKSPACE}/LocalDevVPN-source/LocalDevVPN/LocalDevVPN.entitlements" Payload/LocalDevVPN.app/LocalDevVPN
-          zip -r LocalDevVPN-working-lan-session.ipa Payload
+          test -f Payload/LocalDevVPN.app/LocalDevVPN
+          test -f Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/TunnelProv
+          rm -rf Payload/LocalDevVPN.app/_CodeSignature
+          rm -rf Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/_CodeSignature
+          rm -f Payload/LocalDevVPN.app/embedded.mobileprovision
+          rm -f Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/embedded.mobileprovision
+          zip -r LocalDevVPN-working-lan-session-unsigned.ipa Payload
 
       - name: Store IPA artifact
         uses: actions/upload-artifact@v7
         with:
-          name: LocalDevVPN-working-lan-session
-          path: LocalDevVPN-source/LocalDevVPN-working-lan-session.ipa
+          name: LocalDevVPN-working-lan-session-unsigned
+          path: LocalDevVPN-source/LocalDevVPN-working-lan-session-unsigned.ipa
           archive: false
           retention-days: 30
