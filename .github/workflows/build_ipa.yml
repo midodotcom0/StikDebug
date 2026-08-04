@@ -37,23 +37,54 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package unsigned IPA for iLoader signing
+      - name: Package ad-hoc signed IPA with VPN entitlements
         working-directory: LocalDevVPN-source
         run: |
+          set -euo pipefail
+          rm -rf Payload
           mkdir -p Payload
           cp -R build/LocalDevVPN.xcarchive/Products/Applications/LocalDevVPN.app Payload/LocalDevVPN.app
-          test -f Payload/LocalDevVPN.app/LocalDevVPN
-          test -f Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/TunnelProv
-          rm -rf Payload/LocalDevVPN.app/_CodeSignature
-          rm -rf Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/_CodeSignature
-          rm -f Payload/LocalDevVPN.app/embedded.mobileprovision
-          rm -f Payload/LocalDevVPN.app/PlugIns/TunnelProv.appex/embedded.mobileprovision
-          zip -r LocalDevVPN-working-lan-session-unsigned.ipa Payload
+
+          APP="Payload/LocalDevVPN.app"
+          EXT="$APP/PlugIns/TunnelProv.appex"
+
+          test -f "$APP/LocalDevVPN"
+          test -f "$EXT/TunnelProv"
+
+          rm -rf "$APP/_CodeSignature" "$EXT/_CodeSignature"
+          rm -f "$APP/embedded.mobileprovision" "$EXT/embedded.mobileprovision"
+          xattr -cr "$APP"
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type f \( -name '*.dylib' -o -perm +111 \) -print0 | while IFS= read -r -d '' binary; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$binary"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements TunnelProv/TunnelProv.entitlements \
+            "$EXT"
+
+          /usr/bin/codesign --force --sign - --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements LocalDevVPN/LocalDevVPN.entitlements \
+            "$APP"
+
+          /usr/bin/codesign --verify --deep --strict --verbose=4 "$APP"
+          /usr/bin/codesign -d --entitlements :- "$APP" > main-entitlements.plist
+          /usr/bin/codesign -d --entitlements :- "$EXT" > extension-entitlements.plist
+          grep -q 'com.apple.developer.networking.networkextension' main-entitlements.plist
+          grep -q 'packet-tunnel-provider' main-entitlements.plist
+          grep -q 'com.apple.developer.networking.networkextension' extension-entitlements.plist
+          grep -q 'packet-tunnel-provider' extension-entitlements.plist
+
+          ditto -c -k --sequesterRsrc --keepParent Payload LocalDevVPN-working-lan-session-iloader-entitled.ipa
 
       - name: Store IPA artifact
         uses: actions/upload-artifact@v7
         with:
-          name: LocalDevVPN-working-lan-session-unsigned
-          path: LocalDevVPN-source/LocalDevVPN-working-lan-session-unsigned.ipa
+          name: LocalDevVPN-working-lan-session-iloader-entitled
+          path: LocalDevVPN-source/LocalDevVPN-working-lan-session-iloader-entitled.ipa
           archive: false
           retention-days: 30
